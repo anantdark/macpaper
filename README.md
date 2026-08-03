@@ -139,7 +139,7 @@ Videos are encoded with **HEVC temporal layers** (required for the native freeze
 
 - Calm clips feel best as screensavers; freeze-as-wallpaper does not need long loops
 - Encode is once-through by default (no pad-to-300s). Use `--loop-to 300` only if you want Apple-length clips
-- Re-run `register` after you add files to the folder
+- Re-run `register` after you add files — already-registered clips are kept; only new/changed ones encode
 - If Settings was open during register, quit it or run `macpaper refresh`
 - Re-fix old registrations with `macpaper register <folder> --force-transcode`
 
