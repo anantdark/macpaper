@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot installer for macpaper via Homebrew.
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/anantdark/macpaper/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/anantdark/macpaper/refs/heads/main/scripts/install.sh | bash
 set -euo pipefail
 
 TAP="anantdark/macpaper"
