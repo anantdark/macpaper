@@ -97,6 +97,7 @@ First run may take a few minutes per video while macpaper encodes them the way m
 | `--force-transcode` | Re-encode everything (fix older clips / wallpaper freeze) |
 | `--no-transcode` | Skip encode (screensaver may work; freeze often won’t) |
 | `--quality {standard,high,max}` | Encode bitrate preset (default: `high`) |
+| `--loop-to SECONDS` | Loop short clips during encode to at least SECONDS (default: `0` / off; `300` mimics Apple length — slow) |
 | `--save-transcoded` | Also keep copies under `<folder>/transcoded/` |
 | `--dry-run` | Preview only |
 
@@ -134,7 +135,8 @@ Videos are encoded with **HEVC temporal layers** (required for the native freeze
 
 ## Tips
 
-- Calm, looping clips feel best as screensavers
+- Calm clips feel best as screensavers; freeze-as-wallpaper does not need long loops
+- Encode is once-through by default (no pad-to-300s). Use `--loop-to 300` only if you want Apple-length clips
 - Re-run `register` after you add files to the folder
 - If Settings was open during register, quit it or run `macpaper refresh`
 - Re-fix old registrations with `macpaper register <folder> --force-transcode`

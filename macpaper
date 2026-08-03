@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
@@ -80,10 +80,14 @@ HELPER_BIN = SUPPORT / "bin" / "ImageFolderHelper"
 ENCODE_TEMPORAL_SRC = HELPERS_DIR / "encode_temporal.swift"
 ENCODE_TEMPORAL_BIN = SUPPORT / "bin" / "encode_temporal"
 
-# Apple aerials are ~5–8 min; short clips fail wallpaper freeze / unlock ramp looping.
-TARGET_AERIAL_SECONDS = 300
-# Native aerials are typically 240 fps; we frame-hold slower sources up to this rate.
+# Optional: loop short clips during encode to this length (0 = keep natural duration).
+# Apple aerials are ~300s; looping is slow at 4K/240fps — off by default because
+# temporal layers alone are enough for wallpaper freeze.
+DEFAULT_LOOP_TO_SECONDS = 0
+TARGET_AERIAL_SECONDS = 300  # used when --loop-to is set without a value intent; see --loop-to
 TARGET_AERIAL_FPS = 240
+MAX_ENCODE_LOOPS = 60  # safety cap even when --loop-to is large
+
 
 IMAGE_PLIST = (
     HOME
@@ -377,13 +381,22 @@ def has_temporal_layers(path: Path) -> bool:
         return False
 
 
-def aerial_loop_count(duration_sec: float | None) -> int:
-    """Loop short clips so the encode is long enough for wallpaper freeze."""
+def aerial_loop_count(
+    duration_sec: float | None, *, loop_to_seconds: int = DEFAULT_LOOP_TO_SECONDS
+) -> int:
+    """How many times to repeat the source while encoding.
+
+    Default is 1 (no looping). Pass loop_to_seconds > 0 to pad short clips
+    toward that length (e.g. 300 ≈ Apple aerial duration).
+    """
+    if loop_to_seconds <= 0:
+        return 1
     if not duration_sec or duration_sec <= 0:
         return 1
-    if duration_sec >= TARGET_AERIAL_SECONDS:
+    if duration_sec >= loop_to_seconds:
         return 1
-    return max(1, int(math.ceil(TARGET_AERIAL_SECONDS / duration_sec)))
+    loops = int(math.ceil(loop_to_seconds / duration_sec))
+    return max(1, min(loops, MAX_ENCODE_LOOPS))
 
 
 def probe_video(path: Path) -> dict[str, Any]:
@@ -551,13 +564,22 @@ def encode_temporal_hevc(
     duration: float | None = None,
     target_fps: int = TARGET_AERIAL_FPS,
     loops: int | None = None,
+    loop_to_seconds: int = DEFAULT_LOOP_TO_SECONDS,
 ) -> None:
     """Encode with temporal sub-layers so wallpaper freeze / unlock ramp works."""
     q = quality_settings(quality)
-    loop_n = aerial_loop_count(duration) if loops is None else max(1, loops)
+    loop_n = (
+        max(1, loops)
+        if loops is not None
+        else aerial_loop_count(duration, loop_to_seconds=loop_to_seconds)
+    )
     mbps = q["mbps"]
     encoder = ensure_encode_temporal()
-    loop_note = f", looping ×{loop_n} (~{TARGET_AERIAL_SECONDS}s)" if loop_n > 1 else ""
+    if loop_n > 1:
+        approx = (duration or 0) * loop_n
+        loop_note = f", looping ×{loop_n}" + (f" (~{approx:.0f}s)" if approx else "")
+    else:
+        loop_note = ""
     fps_note = f", target {target_fps} fps" if target_fps else ""
     info(f"  encoding {src.name} → temporal HEVC ({q['label']}{loop_note}{fps_note}) …")
     r = subprocess.run(
@@ -582,6 +604,7 @@ def transcode_or_copy(
     force_transcode: bool,
     skip_transcode: bool,
     quality: str = DEFAULT_QUALITY,
+    loop_to_seconds: int = DEFAULT_LOOP_TO_SECONDS,
 ) -> bool:
     """Write dest from src. Returns True if a re-encode ran.
 
@@ -631,6 +654,7 @@ def transcode_or_copy(
         dest,
         quality=quality,
         duration=probe.get("duration") if isinstance(probe.get("duration"), (int, float)) else None,
+        loop_to_seconds=loop_to_seconds,
     )
     return True
 
@@ -1155,12 +1179,17 @@ def cmd_register(args: argparse.Namespace) -> None:
             info(f"[{i + 1}/{len(videos)}] {src.name}")
             if args.dry_run:
                 probe = probe_video(src)
+                loop_to = int(getattr(args, "loop_to", DEFAULT_LOOP_TO_SECONDS) or 0)
                 if args.force_transcode:
                     info(f"  would force-transcode ({getattr(args, 'quality', DEFAULT_QUALITY)})")
                 elif args.no_transcode or probe.get("ready"):
                     info(f"  would skip transcode — {probe.get('reason')}")
                 else:
                     info(f"  would transcode — {probe.get('reason')}")
+                    if loop_to > 0:
+                        n = aerial_loop_count(probe.get("duration"), loop_to_seconds=loop_to)
+                        if n > 1:
+                            info(f"  would loop ×{n} to ~{loop_to}s")
                 registered_assets[src.name] = {"id": asset_id, "title": title, "kind": "video"}
                 if save_transcoded:
                     info(f"  would save {TRANSCODED_DIR_NAME}/{src.stem}.mov")
@@ -1171,6 +1200,7 @@ def cmd_register(args: argparse.Namespace) -> None:
                 force_transcode=args.force_transcode,
                 skip_transcode=args.no_transcode,
                 quality=getattr(args, "quality", DEFAULT_QUALITY),
+                loop_to_seconds=int(getattr(args, "loop_to", DEFAULT_LOOP_TO_SECONDS) or 0),
             )
             make_thumbnail(dest, thumb)
             new_assets.append(
@@ -1932,6 +1962,16 @@ def build_parser() -> MacpaperParser:
         choices=sorted(QUALITY_PRESETS.keys()),
         default=DEFAULT_QUALITY,
         help=f"Temporal HEVC bitrate preset when encoding (default: {DEFAULT_QUALITY})",
+    )
+    r.add_argument(
+        "--loop-to",
+        type=int,
+        default=DEFAULT_LOOP_TO_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Loop short clips during encode to at least SECONDS "
+            f"(0=off/default; try {TARGET_AERIAL_SECONDS} to mimic Apple aerial length — slow)"
+        ),
     )
     save_group = r.add_mutually_exclusive_group()
     save_group.add_argument(
