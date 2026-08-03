@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
@@ -436,12 +436,32 @@ def transcode_or_copy(
     skip_transcode: bool,
     quality: str = DEFAULT_QUALITY,
 ) -> bool:
-    """Write dest from src. Returns True if ffmpeg transcode ran."""
+    """Write dest from src. Returns True if ffmpeg transcode ran.
+
+    Automatically probes the file (same criteria as `macpaper check`). If it is
+    already aerial-ready, links/copies without re-encoding unless --force-transcode.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
 
-    do_transcode = force_transcode or (not skip_transcode and needs_transcode(src))
+    probe = probe_video(src)
+    ready = bool(probe.get("ready"))
+
+    if force_transcode:
+        do_transcode = True
+        info(f"  check: {S.yellow('force transcode')} ({probe.get('codec')}/{probe.get('tag')})")
+    elif skip_transcode:
+        do_transcode = False
+        info(f"  check: {S.dim('skip encode (--no-transcode)')} — {probe.get('reason')}")
+    elif ready:
+        do_transcode = False
+        info(f"  check: {S.green('ready')} — skipping transcode")
+        info(f"  {S.dim(str(probe.get('reason')))}")
+    else:
+        do_transcode = True
+        info(f"  check: {S.yellow('needs transcode')} — {probe.get('reason')}")
+
     if not do_transcode:
         # Prefer hardlink to save disk; fall back to copy.
         try:
@@ -921,6 +941,13 @@ def cmd_register(args: argparse.Namespace) -> None:
             title = display_title(src)
             info(f"[{i + 1}/{len(videos)}] {src.name}")
             if args.dry_run:
+                probe = probe_video(src)
+                if args.force_transcode:
+                    info(f"  would force-transcode ({getattr(args, 'quality', DEFAULT_QUALITY)})")
+                elif args.no_transcode or probe.get("ready"):
+                    info(f"  would skip transcode — {probe.get('reason')}")
+                else:
+                    info(f"  would transcode — {probe.get('reason')}")
                 registered_assets[src.name] = {"id": asset_id, "title": title, "kind": "video"}
                 if save_transcoded:
                     info(f"  would save {TRANSCODED_DIR_NAME}/{src.stem}.mov")

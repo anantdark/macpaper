@@ -76,8 +76,8 @@ Mistyped commands get “Did you mean …?” hints. Aliases: `add` / `rm` / `ls
 | `--name NAME` | Category name in Wallpaper settings (default: folder name) |
 | `--videos-only` | Only register videos as live aerials |
 | `--images-only` | Only register the folder for still images |
-| `--no-transcode` | Copy/link as-is instead of encoding to HEVC |
-| `--force-transcode` | Always re-encode to HEVC `.mov` |
+| `--no-transcode` | Always copy/link as-is (even if check says not ready) |
+| `--force-transcode` | Always re-encode, even if already aerial-ready |
 | `--quality {standard,high,max}` | Encode quality when transcoding (default: `high`) |
 | `--save-transcoded` | Also copy encodes into `<folder>/transcoded/` |
 | `--no-save-transcoded` | Skip the save prompt; don’t write local copies |
@@ -127,6 +127,8 @@ Inspect a video file or folder and report whether each clip is **aerial-ready wi
 
 If it says **ready**, register with `--no-transcode` to avoid re-encoding. If it **needs transcode**, use `--quality high` (default) or `--quality max` for less loss.
 
+`register` runs this same check automatically per file and skips encoding when ready (unless `--force-transcode`).
+
 ### `list`
 
 Shows only what macpaper manages (not other apps’ custom aerials).
@@ -139,13 +141,14 @@ Restarts `WallpaperAgent` / `cfprefsd` so System Settings reloads.
 
 **Videos** — published through macOS’s built-in aerial catalog (`WallpaperAerialsExtension`):
 
-1. Transcode to HEVC `.mov` (`hvc1`) when needed (`--quality standard|high|max`)
-2. Store under `~/Library/Application Support/com.apple.wallpaper/aerials/videos/`
-3. Write PNG thumbnails under `…/aerials/thumbnails/`
-4. Patch `…/aerials/manifest/entries.json` with a macpaper category and `file://` URLs
-5. Restart WallpaperAgent
+1. Probe each video (same as `check`); skip encode when already aerial-ready
+2. Otherwise transcode to HEVC `.mov` (`hvc1`) with `--quality standard|high|max`
+3. Store under `~/Library/Application Support/com.apple.wallpaper/aerials/videos/`
+4. Write PNG thumbnails under `…/aerials/thumbnails/`
+5. Patch `…/aerials/manifest/entries.json` with a macpaper category and `file://` URLs
+6. Restart WallpaperAgent
 
-Use `macpaper check <file>` first to see if transcoding can be skipped.
+Use `macpaper check <file>` to inspect without registering.
 
 **Images** — register the folder with WallpaperImageExtension (same idea as “Add Folder…” in Settings).
 
