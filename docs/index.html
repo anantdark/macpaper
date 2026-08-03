@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Docs — macpaper</title>
+  <meta name="description" content="Beginner-friendly guide to installing macpaper and turning your videos into native macOS screensavers." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Syne:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../styles.css" />
+</head>
+<body class="docs-body">
+  <div class="noise" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <a class="brand" href="../">macpaper</a>
+    <nav>
+      <a href="../#install">Install</a>
+      <a href="./" aria-current="page">Docs</a>
+      <a href="https://github.com/anantdark/macpaper" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="docs-layout">
+    <aside class="docs-nav">
+      <p class="docs-nav-title">Guide</p>
+      <a href="#what">What is macpaper?</a>
+      <a href="#need">What you need</a>
+      <a href="#install">Install</a>
+      <a href="#first">First screensaver</a>
+      <a href="#everyday">Everyday commands</a>
+      <a href="#check">Check &amp; re-encode</a>
+      <a href="#remove">Remove clips</a>
+      <a href="#troubleshoot">Troubleshooting</a>
+      <a href="#uninstall">Uninstall</a>
+    </aside>
+
+    <article class="docs-main">
+      <p class="eyebrow">Beginner guide</p>
+      <h1>Custom Mac screensavers,<br /><em>in plain language</em></h1>
+      <p class="lede">
+        This guide assumes you’ve never used macpaper before. Follow it top to bottom once —
+        after that, the everyday commands table is enough.
+      </p>
+
+      <section id="what">
+        <h2>What is macpaper?</h2>
+        <p>
+          macpaper is a <strong>free command-line tool</strong> for Mac. You point it at a folder of videos.
+          It registers those videos so they show up in
+          <strong>System Settings → Screen Saver</strong> (and Wallpaper) like Apple’s own Aerials.
+        </p>
+        <p>
+          It does <em>not</em> keep a special app running on top of your desktop.
+          macOS plays the videos itself.
+        </p>
+      </section>
+
+      <section id="need">
+        <h2>What you need</h2>
+        <ul>
+          <li><strong>macOS 26 (Tahoe)</strong> or newer</li>
+          <li><a href="https://brew.sh">Homebrew</a> installed</li>
+          <li>A folder of videos (mp4, mov, etc.)</li>
+          <li>At least <strong>one built-in Aerial</strong> downloaded in System Settings → Wallpaper / Screen Saver (this creates Apple’s catalog file the first time)</li>
+        </ul>
+        <p>
+          On first encode, macpaper may ask macOS to install
+          <strong>Xcode Command Line Tools</strong> — click Install if prompted.
+        </p>
+      </section>
+
+      <section id="install">
+        <h2>Install</h2>
+        <p>Easiest: paste this in Terminal and press Return.</p>
+        <div class="terminal" data-copy>
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <button type="button" class="copy-btn">Copy</button>
+          </div>
+          <pre><code>curl -fsSL https://raw.githubusercontent.com/anantdark/macpaper/refs/heads/main/scripts/install.sh | bash</code></pre>
+        </div>
+        <p>Or with Homebrew directly:</p>
+        <div class="terminal" data-copy>
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <button type="button" class="copy-btn">Copy</button>
+          </div>
+          <pre><code>brew tap anantdark/macpaper
+brew trust anantdark/macpaper
+brew install macpaper
+macpaper version</code></pre>
+        </div>
+        <p>You should see something like <code>macpaper 1.4.2</code>.</p>
+      </section>
+
+      <section id="first">
+        <h2>Make your first screensaver</h2>
+        <ol>
+          <li>Create a folder, e.g. <code>~/Movies/MyClips</code>, and put videos in it.</li>
+          <li>Register it:</li>
+        </ol>
+        <div class="terminal" data-copy>
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <button type="button" class="copy-btn">Copy</button>
+          </div>
+          <pre><code>macpaper register ~/Movies/MyClips --name "My Clips"</code></pre>
+        </div>
+        <ol start="3">
+          <li>Wait while clips encode (first time can take a few minutes each).</li>
+          <li>Quit <strong>System Settings</strong> if it was open, then reopen it.</li>
+          <li>Go to <strong>Screen Saver</strong> → find <strong>My Clips</strong> → choose a video.</li>
+        </ol>
+        <p>
+          Tip: run <code>macpaper</code> with no arguments for an interactive menu.
+        </p>
+      </section>
+
+      <section id="everyday">
+        <h2>Everyday commands</h2>
+        <table>
+          <thead>
+            <tr><th>Goal</th><th>Command</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>See what’s registered</td><td><code>macpaper list</code></td></tr>
+            <tr><td>Add / update a folder</td><td><code>macpaper register ~/Movies/MyClips</code></td></tr>
+            <tr><td>Remove one video by name</td><td><code>macpaper unregister sunset.mp4</code></td></tr>
+            <tr><td>Remove one video by id</td><td><code>macpaper unregister B5F705B9-…</code></td></tr>
+            <tr><td>Remove whole folder</td><td><code>macpaper unregister ~/Movies/MyClips</code></td></tr>
+            <tr><td>Reload Settings</td><td><code>macpaper refresh</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="check">
+        <h2>Check a file &amp; re-encode</h2>
+        <p>Not sure if a clip is ready for the native freeze-as-wallpaper effect?</p>
+        <div class="terminal" data-copy>
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <button type="button" class="copy-btn">Copy</button>
+          </div>
+          <pre><code>macpaper check ~/Movies/MyClips/sunset.mp4</code></pre>
+        </div>
+        <ul>
+          <li><strong>ready</strong> — screensaver + freeze both OK</li>
+          <li><strong>screensaver only</strong> — plays, but freeze needs a temporal re-encode</li>
+          <li><strong>needs encode</strong> — register will encode it</li>
+        </ul>
+        <p>To force-fix everything in a folder (e.g. after upgrading macpaper):</p>
+        <div class="terminal" data-copy>
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <button type="button" class="copy-btn">Copy</button>
+          </div>
+          <pre><code>macpaper register ~/Movies/MyClips --force-transcode</code></pre>
+        </div>
+      </section>
+
+      <section id="remove">
+        <h2>Remove clips safely</h2>
+        <p>
+          <code>unregister</code> never deletes your original files in Movies / Downloads.
+          It only removes Settings listings and the copies macpaper placed in Apple’s aerials folder.
+        </p>
+        <div class="terminal" data-copy>
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <button type="button" class="copy-btn">Copy</button>
+          </div>
+          <pre><code>macpaper list
+macpaper unregister sunset.mp4 --yes
+macpaper unregister ~/Movies/MyClips --yes</code></pre>
+        </div>
+      </section>
+
+      <section id="troubleshoot">
+        <h2>Troubleshooting</h2>
+        <dl class="faq">
+          <dt>I don’t see my category in Settings</dt>
+          <dd>Quit System Settings completely, run <code>macpaper refresh</code>, reopen Settings. Confirm with <code>macpaper list</code>.</dd>
+          <dt>Screensaver works but unlock goes black / no freeze</dt>
+          <dd>Re-encode with temporal layers: <code>macpaper register ~/Movies/MyClips --force-transcode</code>.</dd>
+          <dt>Install says tap isn’t trusted</dt>
+          <dd>Run <code>brew trust anantdark/macpaper</code>, then install again.</dd>
+          <dt>Encode fails / asks for developer tools</dt>
+          <dd>Install Xcode Command Line Tools: <code>xcode-select --install</code>.</dd>
+          <dt>“Aerial manifest not found”</dt>
+          <dd>In System Settings, download any built-in Aerial once so macOS creates <code>entries.json</code>.</dd>
+        </dl>
+      </section>
+
+      <section id="uninstall">
+        <h2>Uninstall</h2>
+        <div class="terminal" data-copy>
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <button type="button" class="copy-btn">Copy</button>
+          </div>
+          <pre><code>macpaper unregister ~/Movies/MyClips --yes
+brew uninstall macpaper
+brew untap anantdark/macpaper
+rm -rf ~/Library/Application\ Support/macpaper</code></pre>
+        </div>
+      </section>
+
+      <p class="docs-end">
+        More detail lives in the
+        <a href="https://github.com/anantdark/macpaper#readme">GitHub README</a>.
+        Issues and ideas welcome on
+        <a href="https://github.com/anantdark/macpaper/issues">GitHub Issues</a>.
+      </p>
+    </article>
+  </div>
+
+  <footer class="site-footer">
+    <a class="brand" href="../">macpaper</a>
+    <div class="footer-links">
+      <a href="../">Home</a>
+      <a href="https://github.com/anantdark/macpaper">GitHub</a>
+      <a href="https://github.com/anantdark/macpaper/blob/main/LICENSE">GPL-3.0</a>
+    </div>
+  </footer>
+
+  <script src="../main.js"></script>
+</body>
+</html>

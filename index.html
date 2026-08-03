@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>macpaper — Custom video screensavers for Mac</title>
+  <meta name="description" content="macpaper turns your videos into native macOS Screen Savers — the same Aerial pipeline Apple uses. Free, open source, terminal-native." />
+  <meta property="og:title" content="macpaper — Custom video screensavers for Mac" />
+  <meta property="og:description" content="Drop a folder of videos. Get a real Mac screensaver. No paid app, no overlay windows." />
+  <meta property="og:type" content="website" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Syne:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <a class="brand" href="./">macpaper</a>
+    <nav>
+      <a href="#how">How it works</a>
+      <a href="docs/">Docs</a>
+      <a href="https://github.com/anantdark/macpaper" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-media" aria-hidden="true">
+        <img src="assets/hero-aerial.jpg" alt="" />
+        <div class="hero-veil"></div>
+      </div>
+      <div class="hero-copy">
+        <p class="brand-mark">macpaper</p>
+        <h1>Your videos.<br /><em>Apple’s screensaver.</em></h1>
+        <p class="lede">
+          A free terminal tool that registers your clips as native macOS Screen Savers —
+          the same Aerial system Apple ships. No floating windows. No paid wallpaper app.
+        </p>
+        <div class="cta-row">
+          <a class="btn primary" href="#install">Install free</a>
+          <a class="btn ghost" href="docs/">Beginner guide</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="strip" id="install">
+      <h2>One line. Then your folder.</h2>
+      <p class="section-lede">Works on macOS 26 (Tahoe). Homebrew handles the rest.</p>
+      <div class="terminal" data-copy>
+        <div class="terminal-bar">
+          <span></span><span></span><span></span>
+          <button type="button" class="copy-btn" aria-label="Copy install command">Copy</button>
+        </div>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/anantdark/macpaper/refs/heads/main/scripts/install.sh | bash</code></pre>
+      </div>
+      <div class="terminal" data-copy>
+        <div class="terminal-bar">
+          <span></span><span></span><span></span>
+          <button type="button" class="copy-btn" aria-label="Copy register command">Copy</button>
+        </div>
+        <pre><code>macpaper register ~/Movies/MyClips --name "My Clips"</code></pre>
+      </div>
+      <p class="fine">Then reopen <strong>System Settings → Screen Saver</strong> and pick your category.</p>
+    </section>
+
+    <section class="features" id="how">
+      <h2>Native — not another overlay.</h2>
+      <p class="section-lede">macpaper talks to Apple’s aerial catalog. Your clips show up next to the built-in Aerials.</p>
+      <ul class="feature-list">
+        <li>
+          <h3>Real Screen Saver</h3>
+          <p>Appears in System Settings. Idle, lock, unlock — the OS handles playback.</p>
+        </li>
+        <li>
+          <h3>Freeze that works</h3>
+          <p>Encodes temporal HEVC the way WallpaperAgent expects, so stop-screensaver can freeze the frame.</p>
+        </li>
+        <li>
+          <h3>Your library</h3>
+          <p>Point at any folder of videos. Add more later and re-run register. Unregister by name or id.</p>
+        </li>
+        <li>
+          <h3>Open &amp; free</h3>
+          <p>GPL-3.0. No subscription. No account. Just a CLI and Apple’s own pipelines.</p>
+        </li>
+      </ul>
+    </section>
+
+    <section class="steps">
+      <h2>Three steps.</h2>
+      <ol class="step-list">
+        <li>
+          <span class="n">01</span>
+          <div>
+            <h3>Install</h3>
+            <p>One-shot curl or <code>brew install macpaper</code>.</p>
+          </div>
+        </li>
+        <li>
+          <span class="n">02</span>
+          <div>
+            <h3>Register a folder</h3>
+            <p><code>macpaper register ~/Movies/MyClips --name "My Clips"</code></p>
+          </div>
+        </li>
+        <li>
+          <span class="n">03</span>
+          <div>
+            <h3>Pick it in Settings</h3>
+            <p>Screen Saver → your category. That’s it.</p>
+          </div>
+        </li>
+      </ol>
+      <a class="btn primary" href="docs/">Read the full beginner guide</a>
+    </section>
+
+    <section class="compare">
+      <h2>Wallpaper apps sell you a player.<br />macpaper gives you the system.</h2>
+      <p class="section-lede">
+        Paid live-wallpaper apps often run their own engine. macpaper publishes into
+        <em>WallpaperAerialsExtension</em> — the same path Apple’s Aerials use —
+        so screensaver and wallpaper stay first-class citizens of macOS.
+      </p>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <a class="brand" href="./">macpaper</a>
+    <div class="footer-links">
+      <a href="docs/">Docs</a>
+      <a href="https://github.com/anantdark/macpaper">GitHub</a>
+      <a href="https://github.com/anantdark/macpaper/releases">Releases</a>
+      <a href="https://github.com/anantdark/macpaper/blob/main/LICENSE">GPL-3.0</a>
+    </div>
+    <p class="fine">Open source. Built for custom Mac screensavers.</p>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>
