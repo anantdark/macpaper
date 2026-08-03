@@ -1,0 +1,1137 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 macpaper contributors
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+"""macpaper — register local videos/images in macOS Wallpaper & Screen Saver settings.
+
+Standalone CLI. Talks only to Apple system paths and its own support directory:
+  ~/Library/Application Support/macpaper/
+
+Videos are published through macOS's built-in aerial wallpaper catalog
+(WallpaperAerialsExtension) on macOS 26+:
+
+  1. Transcode to HEVC .mov (hvc1) when needed
+  2. Store under ~/Library/Application Support/com.apple.wallpaper/aerials/videos/
+  3. Write PNG thumbnails under .../aerials/thumbnails/
+  4. Patch .../aerials/manifest/entries.json with a macpaper category + file:// URLs
+  5. Restart WallpaperAgent
+
+Images are registered via WallpaperImageExtension (System Settings → Wallpaper folders).
+
+No third-party wallpaper apps are required or referenced at runtime.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import difflib
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Sequence
+from urllib.parse import quote
+
+__version__ = "1.0.0"
+
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
+
+# macpaper-owned UUID namespace for deterministic category/asset IDs.
+# Only entries under this namespace / shot prefix are created or removed by macpaper.
+CAT_NAMESPACE = uuid.UUID("CE000000-0000-4000-8000-000000000000")
+SHOT_PREFIX = "macpaper".upper()  # "MACAPER"
+
+HOME = Path.home()
+AERIALS = HOME / "Library/Application Support/com.apple.wallpaper/aerials"
+VIDEOS_DIR = AERIALS / "videos"
+THUMBS_DIR = AERIALS / "thumbnails"
+MANIFEST_DIR = AERIALS / "manifest"
+ENTRIES = MANIFEST_DIR / "entries.json"
+
+SUPPORT = HOME / "Library/Application Support/macpaper"
+STATE_PATH = SUPPORT / "state.json"
+HELPER_SRC = Path(__file__).resolve().parent / "helpers" / "ImageFolderHelper.swift"
+HELPER_BIN = SUPPORT / "bin" / "ImageFolderHelper"
+
+IMAGE_PLIST = (
+    HOME
+    / "Library/Containers/com.apple.wallpaper.extension.image"
+    / "Data/Library/Preferences/com.apple.wallpaper.extension.image.plist"
+)
+
+COMMANDS = ("register", "unregister", "list", "refresh", "help", "version")
+COMMAND_ALIASES: dict[str, str] = {
+    "add": "register",
+    "install": "register",
+    "rm": "unregister",
+    "remove": "unregister",
+    "delete": "unregister",
+    "ls": "list",
+    "status": "list",
+    "reload": "refresh",
+    "restart": "refresh",
+    "-h": "help",
+    "--help": "help",
+    "-v": "version",
+    "--version": "version",
+}
+
+# ── terminal styling ──────────────────────────────────────────────────────────
+
+
+def _use_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+class Style:
+    def __init__(self) -> None:
+        self.on = _use_color()
+
+    def _wrap(self, code: str, text: str) -> str:
+        if not self.on:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+    def bold(self, t: str) -> str:
+        return self._wrap("1", t)
+
+    def dim(self, t: str) -> str:
+        return self._wrap("2", t)
+
+    def cyan(self, t: str) -> str:
+        return self._wrap("36", t)
+
+    def green(self, t: str) -> str:
+        return self._wrap("32", t)
+
+    def yellow(self, t: str) -> str:
+        return self._wrap("33", t)
+
+    def red(self, t: str) -> str:
+        return self._wrap("31", t)
+
+    def magenta(self, t: str) -> str:
+        return self._wrap("35", t)
+
+
+S = Style()
+
+
+def die(msg: str, code: int = 1, hint: str | None = None) -> None:
+    print(f"{S.red('✗')} {S.bold('error:')} {msg}", file=sys.stderr)
+    if hint:
+        print(f"  {S.dim('hint:')} {hint}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def info(msg: str) -> None:
+    print(msg)
+
+
+def ok(msg: str) -> None:
+    print(f"{S.green('✓')} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{S.yellow('!')} {msg}", file=sys.stderr)
+
+
+def suggest_command(token: str) -> str | None:
+    pool = list(COMMANDS) + list(COMMAND_ALIASES.keys())
+    # Prefer real commands over aliases in suggestions
+    matches = difflib.get_close_matches(token.lower(), pool, n=3, cutoff=0.5)
+    if not matches:
+        return None
+    resolved = []
+    for m in matches:
+        canon = COMMAND_ALIASES.get(m, m)
+        if canon not in resolved:
+            resolved.append(canon)
+    if not resolved:
+        return None
+    quoted = ", ".join(S.cyan(c) for c in resolved)
+    return f"Did you mean {quoted}?"
+
+
+def resolve_command(token: str) -> str | None:
+    t = token.lower()
+    if t in COMMANDS:
+        return t
+    return COMMAND_ALIASES.get(t)
+
+
+def normalize_path(path: Path | str) -> str:
+    """Resolve and collapse macOS /var ↔ /private/var (and /tmp) dual paths."""
+    p = Path(path).expanduser().resolve()
+    s = str(p)
+    # Prefer the /private form so comparisons stay stable.
+    for prefix in ("/tmp", "/var"):
+        if s == prefix or s.startswith(prefix + "/"):
+            s = "/private" + s
+            break
+    return s.rstrip("/") or "/"
+
+
+def file_url(path: Path) -> str:
+    # file:///… with percent-encoded path segments (spaces etc.)
+    parts = path.resolve().parts
+    # parts[0] is '/' on POSIX
+    encoded = "/".join(quote(p, safe="") for p in parts[1:])
+    return f"file:///{encoded}"
+
+
+def load_state() -> dict[str, Any]:
+    if STATE_PATH.exists():
+        return json.loads(STATE_PATH.read_text())
+    return {"folders": {}}
+
+
+def save_state(state: dict[str, Any]) -> None:
+    SUPPORT.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def deterministic_uuid(name: str) -> str:
+    return str(uuid.uuid5(CAT_NAMESPACE, name)).upper()
+
+
+def scan_folder(folder: Path) -> tuple[list[Path], list[Path]]:
+    videos: list[Path] = []
+    images: list[Path] = []
+    for p in sorted(folder.iterdir()):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        ext = p.suffix.lower()
+        if ext in VIDEO_EXTS:
+            videos.append(p)
+        elif ext in IMAGE_EXTS:
+            images.append(p)
+    return videos, images
+
+
+def ensure_aerials_ready() -> None:
+    if not ENTRIES.exists():
+        die(
+            f"Aerial manifest missing at {ENTRIES}\n"
+            "Download at least one built-in aerial wallpaper/screensaver in\n"
+            "System Settings → Wallpaper (or Screen Saver) once, then re-run."
+        )
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_entries() -> dict[str, Any]:
+    return json.loads(ENTRIES.read_text())
+
+
+def save_entries(data: dict[str, Any]) -> None:
+    backup = MANIFEST_DIR / f"entries.json.macpaper-bak-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    if ENTRIES.exists():
+        shutil.copy2(ENTRIES, backup)
+    ENTRIES.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def restart_wallpaper_services() -> None:
+    for name in ("cfprefsd", "WallpaperAgent"):
+        subprocess.run(
+            ["/usr/bin/killall", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    info("Restarted WallpaperAgent / cfprefsd — reopen System Settings if it was open.")
+
+
+def needs_transcode(path: Path) -> bool:
+    """Return True unless ffprobe says HEVC in a QuickTime/.mov-friendly tag."""
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,codec_tag_string:format=format_name",
+                "-of",
+                "json",
+                str(path),
+            ],
+            text=True,
+        )
+        meta = json.loads(out)
+        streams = meta.get("streams") or []
+        if not streams:
+            return True
+        codec = (streams[0].get("codec_name") or "").lower()
+        tag = (streams[0].get("codec_tag_string") or "").lower()
+        fmt = (meta.get("format") or {}).get("format_name") or ""
+        if codec in {"hevc", "h265"} and ("mov" in fmt or path.suffix.lower() == ".mov"):
+            # hvc1 is ideal; hev1 often still plays — accept both when already .mov/hevc
+            return False
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
+        return True
+
+
+def transcode_or_copy(src: Path, dest: Path, *, force_transcode: bool, skip_transcode: bool) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+
+    do_transcode = force_transcode or (not skip_transcode and needs_transcode(src))
+    if not do_transcode:
+        # Prefer hardlink to save disk; fall back to copy.
+        try:
+            os.link(src, dest)
+            info(f"  linked  {src.name} → {dest.name}")
+            return
+        except OSError:
+            shutil.copy2(src, dest)
+            info(f"  copied  {src.name} → {dest.name}")
+            return
+
+    info(f"  transcoding {src.name} → HEVC .mov …")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-an",
+        "-c:v",
+        "hevc_videotoolbox",
+        "-tag:v",
+        "hvc1",
+        "-b:v",
+        "12M",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(dest),
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0 or not dest.exists() or dest.stat().st_size < 1024:
+        # Software fallback
+        info("  videotoolbox failed, trying libx265 …")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src),
+            "-an",
+            "-c:v",
+            "libx265",
+            "-tag:v",
+            "hvc1",
+            "-crf",
+            "20",
+            "-preset",
+            "medium",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ]
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not dest.exists():
+            die(f"ffmpeg failed for {src.name}:\n{r.stderr[-2000:]}")
+
+
+def make_thumbnail(video: Path, thumb: Path) -> None:
+    thumb.parent.mkdir(parents=True, exist_ok=True)
+    if thumb.exists():
+        thumb.unlink()
+    # Grab a frame ~1s in (or first frame if shorter)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        "1",
+        "-i",
+        str(video),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale='min(1920,iw)':-2",
+        str(thumb),
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0 or not thumb.exists():
+        cmd[3] = "0"
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not thumb.exists():
+            die(f"thumbnail failed for {video.name}:\n{r.stderr[-1500:]}")
+
+
+def display_title(path: Path) -> str:
+    return path.stem.replace("_", " ").replace("-", " ").strip() or path.stem
+
+
+def remove_category_assets(entries: dict[str, Any], category_id: str, subcategory_id: str) -> list[str]:
+    """Remove a macpaper category and every asset linked to it.
+
+    Safe vs other apps: macpaper category IDs are deterministic UUIDs under
+    CAT_NAMESPACE, so we only ever match entries we created.
+    """
+    removed_ids: list[str] = []
+    keep_assets = []
+    for a in entries.get("assets") or []:
+        cats = a.get("categories") or []
+        subs = a.get("subcategories") or []
+        if category_id in cats or subcategory_id in subs:
+            removed_ids.append(a["id"])
+        else:
+            keep_assets.append(a)
+    entries["assets"] = keep_assets
+    entries["categories"] = [c for c in (entries.get("categories") or []) if c.get("id") != category_id]
+    return removed_ids
+
+
+def build_asset(
+    *,
+    asset_id: str,
+    title: str,
+    category_id: str,
+    subcategory_id: str,
+    video_path: Path,
+    thumb_path: Path,
+    order: int,
+) -> dict[str, Any]:
+    short = asset_id.replace("-", "")[-6:]
+    return {
+        "accessibilityLabel": title,
+        "categories": [category_id],
+        "id": asset_id,
+        "includeInShuffle": True,
+        "localizedNameKey": title,
+        "pointsOfInterest": {"0": f"{SHOT_PREFIX}_{short}_0"},
+        "preferredOrder": order,
+        "previewImage": file_url(thumb_path),
+        "shotID": f"{SHOT_PREFIX}_{short}",
+        "showInTopLevel": True,
+        "subcategories": [subcategory_id],
+        "url-4K-SDR-240FPS": file_url(video_path),
+    }
+
+
+def build_category(
+    *,
+    category_id: str,
+    subcategory_id: str,
+    name: str,
+    representative_id: str,
+    preview_url: str,
+) -> dict[str, Any]:
+    return {
+        "id": category_id,
+        "localizedDescriptionKey": name,
+        "localizedNameKey": name,
+        "preferredOrder": 0,
+        "previewImage": preview_url,
+        "representativeAssetID": representative_id,
+        "subcategories": [
+            {
+                "id": subcategory_id,
+                "localizedDescriptionKey": name,
+                "localizedNameKey": name,
+                "preferredOrder": 0,
+                "previewImage": preview_url,
+                "representativeAssetID": representative_id,
+            }
+        ],
+    }
+
+
+def ensure_helper() -> Path:
+    HELPER_BIN.parent.mkdir(parents=True, exist_ok=True)
+    if HELPER_BIN.exists() and HELPER_BIN.stat().st_mtime >= HELPER_SRC.stat().st_mtime:
+        return HELPER_BIN
+    if not HELPER_SRC.exists():
+        die(f"Swift helper missing: {HELPER_SRC}")
+    info("Compiling ImageFolderHelper (one-time)…")
+    r = subprocess.run(
+        ["swiftc", "-O", "-o", str(HELPER_BIN), str(HELPER_SRC)],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        die(f"swiftc failed:\n{r.stderr}")
+    return HELPER_BIN
+
+
+def make_image_folder_entry_blob(folder: Path) -> bytes:
+    helper = ensure_helper()
+    r = subprocess.run(
+        [str(helper), "entry", str(folder.resolve())],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        die(f"bookmark helper failed:\n{r.stderr.strip() or r.stdout}")
+    return base64.b64decode(r.stdout.strip())
+
+
+def load_image_plist() -> dict[str, Any]:
+    if not IMAGE_PLIST.exists():
+        return {
+            "ChoiceRequests.Assets": [],
+            "ChoiceRequests.CollectionIdentifiers": [],
+            "ChoiceRequests.ImageFiles": [],
+            "ChoiceRequests.ImageFolders": [],
+            "ChoiceRequests.PersonIdentifiers": [],
+            "DidPerformImagesContainerMigration": True,
+            "DidPerformPhotosContainerMigration": True,
+            "DidPerformPhotosMigration": True,
+        }
+    with IMAGE_PLIST.open("rb") as f:
+        return plistlib.load(f)
+
+
+def save_image_plist(data: dict[str, Any]) -> None:
+    IMAGE_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with IMAGE_PLIST.open("wb") as f:
+        plistlib.dump(data, f, fmt=plistlib.FMT_BINARY)
+
+
+def path_from_folder_entry(blob: bytes) -> str | None:
+    try:
+        entry = plistlib.loads(blob)
+        rel = (entry.get("originalURL") or {}).get("relative")
+        if not rel:
+            return None
+        # file:///path/
+        if rel.startswith("file://"):
+            from urllib.parse import unquote, urlparse
+
+            return unquote(urlparse(rel).path).rstrip("/")
+        return None
+    except Exception:
+        return None
+
+
+def register_image_folder(folder: Path) -> bool:
+    """Return True if newly added, False if already present."""
+    data = load_image_plist()
+    folders: list[bytes] = list(data.get("ChoiceRequests.ImageFolders") or [])
+    target = normalize_path(folder)
+    for blob in folders:
+        existing = path_from_folder_entry(blob)
+        if existing and normalize_path(existing) == target:
+            return False
+    folders.append(make_image_folder_entry_blob(folder))
+    data["ChoiceRequests.ImageFolders"] = folders
+    save_image_plist(data)
+    return True
+
+
+def unregister_image_folder(folder: Path) -> bool:
+    data = load_image_plist()
+    folders: list[bytes] = list(data.get("ChoiceRequests.ImageFolders") or [])
+    target = normalize_path(folder)
+    new_folders = []
+    removed = False
+    for blob in folders:
+        existing = path_from_folder_entry(blob)
+        if existing and normalize_path(existing) == target:
+            removed = True
+            continue
+        new_folders.append(blob)
+    if removed:
+        data["ChoiceRequests.ImageFolders"] = new_folders
+        save_image_plist(data)
+    return removed
+
+
+def cmd_register(args: argparse.Namespace) -> None:
+    folder = Path(normalize_path(args.folder))
+    if not folder.is_dir():
+        die(f"not a directory: {folder}")
+
+    videos, images = scan_folder(folder)
+    if not videos and not images:
+        die(f"no video/image files found in {folder}")
+
+    info(f"Folder: {folder}")
+    info(f"Found {len(videos)} video(s), {len(images)} image(s)")
+
+    state = load_state()
+    key = normalize_path(folder)
+    category_id = deterministic_uuid(f"category:{key}")
+    subcategory_id = deterministic_uuid(f"subcategory:{key}")
+    cat_name = args.name or folder.name
+
+    registered_assets: dict[str, Any] = {}
+    did_videos = False
+    did_images = False
+
+    if videos and not args.images_only:
+        ensure_aerials_ready()
+        entries = load_entries()
+
+        # Drop previous registration for this folder
+        prev = state.get("folders", {}).get(key, {})
+        old_cat = prev.get("category_id", category_id)
+        old_sub = prev.get("subcategory_id", subcategory_id)
+        removed = remove_category_assets(entries, old_cat, old_sub)
+        for aid in removed:
+            for p in (VIDEOS_DIR / f"{aid}.mov", THUMBS_DIR / f"{aid}.png"):
+                if p.exists():
+                    p.unlink()
+
+        new_assets: list[dict[str, Any]] = []
+        for i, src in enumerate(videos):
+            asset_id = deterministic_uuid(f"asset:{key}:{src.name}")
+            dest = VIDEOS_DIR / f"{asset_id}.mov"
+            thumb = THUMBS_DIR / f"{asset_id}.png"
+            title = display_title(src)
+            info(f"[{i + 1}/{len(videos)}] {src.name}")
+            if args.dry_run:
+                registered_assets[src.name] = {"id": asset_id, "title": title, "kind": "video"}
+                continue
+            transcode_or_copy(
+                src,
+                dest,
+                force_transcode=args.force_transcode,
+                skip_transcode=args.no_transcode,
+            )
+            make_thumbnail(dest, thumb)
+            new_assets.append(
+                build_asset(
+                    asset_id=asset_id,
+                    title=title,
+                    category_id=category_id,
+                    subcategory_id=subcategory_id,
+                    video_path=dest,
+                    thumb_path=thumb,
+                    order=i,
+                )
+            )
+            registered_assets[src.name] = {
+                "id": asset_id,
+                "title": title,
+                "kind": "video",
+                "source": str(src),
+            }
+
+        if not args.dry_run and new_assets:
+            preview = new_assets[0]["previewImage"]
+            rep = new_assets[0]["id"]
+            entries.setdefault("assets", []).extend(new_assets)
+            # Put our category first so it's easy to find
+            cat = build_category(
+                category_id=category_id,
+                subcategory_id=subcategory_id,
+                name=cat_name,
+                representative_id=rep,
+                preview_url=preview,
+            )
+            entries["categories"] = [cat] + list(entries.get("categories") or [])
+            save_entries(entries)
+            did_videos = True
+            info(f"Registered {len(new_assets)} video(s) under category “{cat_name}”")
+
+    if images and not args.videos_only:
+        if args.dry_run:
+            info(f"Would register image folder: {folder}")
+            did_images = True
+        else:
+            added = register_image_folder(folder)
+            did_images = True
+            if added:
+                info("Registered folder for still images in System Settings → Wallpaper")
+            else:
+                info("Image folder already registered in System Settings")
+
+    if args.dry_run:
+        info("Dry run — no changes written.")
+        return
+
+    state.setdefault("folders", {})[key] = {
+        "category_id": category_id,
+        "subcategory_id": subcategory_id,
+        "name": cat_name,
+        "assets": registered_assets,
+        "image_folder_registered": bool(images and not args.videos_only),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_state(state)
+
+    if (did_videos or did_images) and not args.no_restart:
+        restart_wallpaper_services()
+
+    info("")
+    ok("Done. Open System Settings → Wallpaper (and Screen Saver).")
+    if did_videos:
+        info(f"  Videos appear under the “{cat_name}” aerial collection.")
+    if did_images:
+        info(f"  Images appear from the registered folder “{folder.name}”.")
+    info(f"  {S.dim('Tip:')} run {S.cyan('macpaper list')} to confirm.")
+
+
+def cmd_unregister(args: argparse.Namespace) -> None:
+    folder = Path(normalize_path(args.folder))
+    key = normalize_path(folder)
+    state = load_state()
+    prev = state.get("folders", {}).get(key)
+    # Also try non-/private key in case an older run stored /tmp/…
+    if not prev:
+        alt = key[len("/private") :] if key.startswith("/private/") else "/private" + key
+        prev = state.get("folders", {}).get(alt)
+        if prev:
+            key = alt
+
+    if not prev and not args.force:
+        die(f"folder not tracked by macpaper: {folder}\n(use --force to scrub by path hash anyway)")
+
+    category_id = (prev or {}).get("category_id") or deterministic_uuid(f"category:{normalize_path(folder)}")
+    subcategory_id = (prev or {}).get("subcategory_id") or deterministic_uuid(
+        f"subcategory:{normalize_path(folder)}"
+    )
+
+    if ENTRIES.exists():
+        entries = load_entries()
+        removed = remove_category_assets(entries, category_id, subcategory_id)
+        save_entries(entries)
+        for aid in removed:
+            for p in (VIDEOS_DIR / f"{aid}.mov", THUMBS_DIR / f"{aid}.png"):
+                if p.exists():
+                    p.unlink()
+        info(f"Removed {len(removed)} aerial asset(s)")
+
+    if unregister_image_folder(folder):
+        info("Removed image folder registration")
+    else:
+        info("No image folder registration found")
+
+    if key in state.get("folders", {}):
+        del state["folders"][key]
+        save_state(state)
+
+    if not args.no_restart:
+        restart_wallpaper_services()
+    ok("Unregistered.")
+
+
+def is_macpaper_asset(asset: dict[str, Any], owned_ids: set[str] | None = None) -> bool:
+    """True if this aerial entry was authored by macpaper."""
+    if owned_ids is not None and asset.get("id") in owned_ids:
+        return True
+    shot = str(asset.get("shotID") or "")
+    if shot.startswith(f"{SHOT_PREFIX}_"):
+        return True
+    # Deterministic IDs from our namespace always use version-5 UUID layout with
+    # our CAT_NAMESPACE; also accept assets whose category id is tracked in state.
+    return False
+
+
+def owned_ids_from_state(state: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for meta in (state.get("folders") or {}).values():
+        if meta.get("category_id"):
+            ids.add(meta["category_id"])
+        if meta.get("subcategory_id"):
+            ids.add(meta["subcategory_id"])
+        for asset in (meta.get("assets") or {}).values():
+            if isinstance(asset, dict) and asset.get("id"):
+                ids.add(asset["id"])
+    return ids
+
+
+def cmd_list(_: argparse.Namespace) -> None:
+    state = load_state()
+    folders = state.get("folders") or {}
+    owned = owned_ids_from_state(state)
+
+    if not folders:
+        info(S.dim("No folders registered via macpaper."))
+    else:
+        info(S.bold("Tracked by macpaper:"))
+        for path, meta in folders.items():
+            assets = meta.get("assets") or {}
+            info(f"  {S.cyan(path)}")
+            info(f"    category: {meta.get('name')} ({S.dim(str(meta.get('category_id')))})")
+            info(f"    videos:   {len(assets)}")
+            info(f"    images:   {'yes' if meta.get('image_folder_registered') else 'no'}")
+
+    # Image folders macpaper registered (intersection with state when possible)
+    macpaper_image_folders = {
+        normalize_path(p)
+        for p, meta in folders.items()
+        if meta.get("image_folder_registered")
+    }
+    if IMAGE_PLIST.exists():
+        data = load_image_plist()
+        live = []
+        for blob in data.get("ChoiceRequests.ImageFolders") or []:
+            p = path_from_folder_entry(blob)
+            if not p:
+                continue
+            # Prefer showing folders we track; if none tracked, show none from us
+            if macpaper_image_folders and normalize_path(p) in macpaper_image_folders:
+                live.append(p)
+            elif not macpaper_image_folders and folders:
+                # state says we registered images but path normalize mismatch — show all
+                # only if this folder key is under our state paths
+                pass
+        info("")
+        info(S.bold("macpaper image folders in System Settings:"))
+        if not live:
+            info(S.dim("  (none)"))
+        for p in live:
+            info(f"  {p}")
+
+    # Only macpaper aerial assets — never list other apps' custom entries
+    if ENTRIES.exists():
+        entries = load_entries()
+        ours = [a for a in entries.get("assets") or [] if is_macpaper_asset(a, owned)]
+        info("")
+        info(S.bold(f"macpaper aerial assets: {len(ours)}"))
+        if not ours:
+            info(S.dim("  (none)"))
+        for a in ours:
+            aid = a.get("id")
+            info(f"  {a.get('localizedNameKey')}  {S.dim(f'({aid})')}")
+    else:
+        info("")
+        warn(f"Aerial manifest not found yet at {ENTRIES}")
+        info(S.dim("  Download one built-in aerial in System Settings first."))
+
+
+def cmd_refresh(_: argparse.Namespace) -> None:
+    restart_wallpaper_services()
+    ok("Wallpaper services restarted.")
+
+
+def cmd_version(_: argparse.Namespace | None = None) -> None:
+    print(f"macpaper {__version__}")
+    print("License: GPL-3.0-or-later <https://www.gnu.org/licenses/gpl-3.0.html>")
+
+
+def cmd_help(_: argparse.Namespace | None = None) -> None:
+    print_banner_help()
+
+
+# ── help / interactive UI ─────────────────────────────────────────────────────
+
+
+def print_banner_help() -> None:
+    bar = S.dim("─" * 56)
+    print()
+    print(f"  {S.bold(S.magenta('macpaper'))}  {S.dim(f'v{__version__}')}")
+    print(f"  {S.dim('Register local videos & images in macOS Wallpaper / Screen Saver')}")
+    print(f"  {bar}")
+    print()
+    print(f"  {S.bold('Usage')}")
+    print(f"    macpaper {S.cyan('<command>')} [options]")
+    print()
+    print(f"  {S.bold('Commands')}")
+    rows = [
+        ("register", "add", "Register a folder of videos/images"),
+        ("unregister", "rm", "Remove a previously registered folder"),
+        ("list", "ls", "Show what macpaper has registered"),
+        ("refresh", "reload", "Restart WallpaperAgent so Settings reloads"),
+        ("help", "-h", "Show this help"),
+        ("version", "-v", "Print version"),
+    ]
+    for name, alias, desc in rows:
+        print(f"    {S.cyan(f'{name:<12}')} {S.dim(f'({alias})'):<10}  {desc}")
+    print()
+    print(f"  {S.bold('Examples')}")
+    print(f"    {S.dim('$')} macpaper register ~/Movies/Wallpapers --name \"My Wallpapers\"")
+    print(f"    {S.dim('$')} macpaper register ~/Clips --videos-only")
+    print(f"    {S.dim('$')} macpaper list")
+    print(f"    {S.dim('$')} macpaper unregister ~/Movies/Wallpapers")
+    print()
+    print(f"  {S.bold('Tips')}")
+    print(f"    Run {S.cyan('macpaper <command> --help')} for command-specific flags.")
+    print(f"    After registering, reopen {S.bold('System Settings → Wallpaper')}.")
+    print(f"    Need an interactive walkthrough? Just run {S.cyan('macpaper')} with no args.")
+    print()
+
+
+def _prompt(label: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        raw = input(f"  {S.cyan('›')} {label}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(130)
+    if not raw and default is not None:
+        return default
+    return raw
+
+
+def _prompt_yes_no(label: str, default: bool = False) -> bool:
+    hint = "Y/n" if default else "y/N"
+    ans = _prompt(f"{label} ({hint})", "").lower()
+    if not ans:
+        return default
+    return ans in {"y", "yes"}
+
+
+def interactive_menu() -> list[str]:
+    """Guided prompt that returns an argv-like list for the chosen command."""
+    print_banner_help()
+    if not sys.stdin.isatty():
+        return ["help"]
+
+    print(f"  {S.bold('What would you like to do?')}")
+    print(f"    {S.cyan('1')}  Register a folder")
+    print(f"    {S.cyan('2')}  Unregister a folder")
+    print(f"    {S.cyan('3')}  List registered media")
+    print(f"    {S.cyan('4')}  Refresh WallpaperAgent")
+    print(f"    {S.cyan('5')}  Quit")
+    print()
+
+    choice = _prompt("Choose 1–5", "1")
+    mapping = {
+        "1": "register",
+        "2": "unregister",
+        "3": "list",
+        "4": "refresh",
+        "5": "quit",
+        "register": "register",
+        "unregister": "unregister",
+        "list": "list",
+        "refresh": "refresh",
+        "quit": "quit",
+        "q": "quit",
+    }
+    cmd = mapping.get(choice.lower())
+    if cmd is None:
+        hint = suggest_command(choice)
+        die(f"unknown choice “{choice}”", hint=hint or "Enter a number from 1–5.")
+    if cmd == "quit":
+        print(f"  {S.dim('Bye.')}")
+        raise SystemExit(0)
+
+    argv = [cmd]
+    if cmd in {"register", "unregister"}:
+        folder = _prompt("Folder path")
+        if not folder:
+            die("a folder path is required", hint="Example: ~/Movies/Wallpapers")
+        argv.append(folder)
+        if cmd == "register":
+            name = _prompt("Category name (optional, Enter to skip)", "")
+            if name:
+                argv.extend(["--name", name])
+            if _prompt_yes_no("Videos only?", False):
+                argv.append("--videos-only")
+            elif _prompt_yes_no("Images only?", False):
+                argv.append("--images-only")
+            if _prompt_yes_no("Dry run (preview only)?", False):
+                argv.append("--dry-run")
+        print()
+        print(f"  {S.dim('Running:')} macpaper {' '.join(argv)}")
+        print()
+    return argv
+
+
+# ── argparse ──────────────────────────────────────────────────────────────────
+
+
+class MacpaperParser(argparse.ArgumentParser):
+    """Friendlier errors: suggestions, no raw argparse dump on typos."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        unknown = None
+        if "invalid choice:" in message:
+            try:
+                unknown = message.split("invalid choice:", 1)[1].strip().split()[0].strip("'\"")
+            except IndexError:
+                unknown = None
+        elif "unrecognized arguments:" in message:
+            try:
+                unknown = message.split("unrecognized arguments:", 1)[1].strip().split()[0]
+            except IndexError:
+                unknown = None
+
+        # Infer active command from argv (subparser prog is not always set usefully)
+        active_cmd = None
+        for tok in sys.argv[1:]:
+            if tok.startswith("-"):
+                continue
+            resolved = resolve_command(tok)
+            if resolved and resolved not in {"help", "version"}:
+                active_cmd = resolved
+                break
+
+        print(f"{S.red('✗')} {S.bold('error:')} {message}", file=sys.stderr)
+        if unknown:
+            if unknown.startswith("-"):
+                target = f"macpaper {active_cmd} --help" if active_cmd else "macpaper help"
+                print(
+                    f"  {S.dim('hint:')} Unknown flag. Run {S.cyan(target)} to see valid options.",
+                    file=sys.stderr,
+                )
+            else:
+                hint = suggest_command(unknown)
+                if hint:
+                    print(f"  {S.dim('hint:')} {hint}", file=sys.stderr)
+                else:
+                    print(
+                        f"  {S.dim('hint:')} Run {S.cyan('macpaper help')} to see available commands.",
+                        file=sys.stderr,
+                    )
+        elif "required" in message and "folder" in message:
+            example_cmd = active_cmd or "register"
+            print(
+                f"  {S.dim('hint:')} Example: {S.cyan(f'macpaper {example_cmd} ~/Movies/Wallpapers')}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  {S.dim('hint:')} Run {S.cyan('macpaper help')} or {S.cyan('macpaper')} for usage.",
+                file=sys.stderr,
+            )
+        raise SystemExit(2)
+
+    def print_help(self, file=None) -> None:  # type: ignore[override]
+        if self.prog == "macpaper":
+            print_banner_help()
+        else:
+            super().print_help(file)
+
+
+def build_parser() -> MacpaperParser:
+    p = MacpaperParser(
+        prog="macpaper",
+        description="Register local videos & images in macOS Wallpaper / Screen Saver.",
+        add_help=False,  # we handle help ourselves for a consistent brand
+    )
+    sub = p.add_subparsers(
+        dest="cmd",
+        required=False,
+        metavar="command",
+        parser_class=MacpaperParser,
+    )
+
+    def add_cmd(name: str, help_text: str, handler: Callable, aliases: Sequence[str] = ()) -> argparse.ArgumentParser:
+        sp = sub.add_parser(
+            name,
+            help=help_text,
+            aliases=list(aliases),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        sp.set_defaults(func=handler)
+        return sp
+
+    r = add_cmd(
+        "register",
+        "Register a folder of videos/images",
+        cmd_register,
+        aliases=("add", "install"),
+    )
+    r.add_argument("folder", help="Folder containing videos and/or images")
+    r.add_argument("--name", help="Category name in Wallpaper settings (default: folder name)")
+    r.add_argument("--videos-only", action="store_true", help="Only register videos as aerials")
+    r.add_argument("--images-only", action="store_true", help="Only register the folder for still images")
+    r.add_argument("--no-transcode", action="store_true", help="Copy/link as-is (skip HEVC encode)")
+    r.add_argument("--force-transcode", action="store_true", help="Always re-encode to HEVC")
+    r.add_argument("--no-restart", action="store_true", help="Do not restart WallpaperAgent")
+    r.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    r.epilog = "Example:\n  macpaper register ~/Movies/Wallpapers --name \"My Wallpapers\""
+
+    u = add_cmd(
+        "unregister",
+        "Remove a previously registered folder",
+        cmd_unregister,
+        aliases=("rm", "remove", "delete"),
+    )
+    u.add_argument("folder", help="Folder previously passed to register")
+    u.add_argument("--force", action="store_true", help="Scrub even if not in macpaper state")
+    u.add_argument("--no-restart", action="store_true", help="Do not restart WallpaperAgent")
+
+    add_cmd("list", "List registered folders / custom aerials", cmd_list, aliases=("ls", "status"))
+    add_cmd("refresh", "Restart WallpaperAgent so Settings reloads", cmd_refresh, aliases=("reload", "restart"))
+    add_cmd("help", "Show help", cmd_help)
+    add_cmd("version", "Print version", cmd_version)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Bare invocation → interactive help / guided menu
+    if not argv:
+        argv = interactive_menu()
+
+    head = argv[0] if argv else ""
+    head_l = head.lower()
+
+    # Global help / version (not `macpaper register --help`)
+    if head_l in {"-h", "--help", "help"} and len(argv) == 1:
+        print_banner_help()
+        return
+    if head_l in {"-v", "--version", "version"} and len(argv) == 1:
+        cmd_version()
+        return
+
+    # Unknown top-level command → soft fail with suggestion
+    known = {
+        "register",
+        "unregister",
+        "list",
+        "refresh",
+        "help",
+        "version",
+        "add",
+        "install",
+        "rm",
+        "remove",
+        "delete",
+        "ls",
+        "status",
+        "reload",
+        "restart",
+    }
+    if argv and not argv[0].startswith("-") and argv[0].lower() not in known:
+        token = argv[0]
+        hint = suggest_command(token)
+        die(
+            f"unknown command “{token}”",
+            hint=hint or f"Run {S.cyan('macpaper help')} to see available commands.",
+        )
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not getattr(args, "cmd", None) or not getattr(args, "func", None):
+        print_banner_help()
+        return
+
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        # `macpaper list | head` etc.
+        raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    main()

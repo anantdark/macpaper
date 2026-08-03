@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.swp
+.idea/
+.vscode/
+/Users/user/Library/Caches/macpaper-brew/
