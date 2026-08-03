@@ -13,13 +13,15 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 
 echo "==> Tapping ${TAP}"
-brew tap "${TAP}"
+brew tap "${TAP}" </dev/null
 
 echo "==> Trusting ${TAP}"
-brew trust "${TAP}"
+brew trust "${TAP}" </dev/null
 
 echo "==> Installing ${FORMULA}"
-brew install "${FORMULA}"
+# Close stdin: when this script is piped via `curl | bash`, brew would otherwise
+# consume the remaining script lines as stdin and skip the trailing echoes.
+brew install "${FORMULA}" </dev/null
 
 echo
 echo "Done. Try:  macpaper version"
