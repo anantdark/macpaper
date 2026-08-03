@@ -17,6 +17,7 @@ Uses only Apple system paths and its own data directory. No other wallpaper apps
 
 ```bash
 brew tap anantdark/macpaper
+brew trust anantdark/macpaper   # Homebrew 6+ third-party tap trust
 brew install macpaper
 ```
 
