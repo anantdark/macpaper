@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
@@ -80,7 +80,7 @@ IMAGE_PLIST = (
     / "Data/Library/Preferences/com.apple.wallpaper.extension.image.plist"
 )
 
-COMMANDS = ("register", "unregister", "unregister-video", "list", "refresh", "help", "version")
+COMMANDS = ("register", "unregister", "unregister-video", "check", "list", "refresh", "help", "version")
 COMMAND_ALIASES: dict[str, str] = {
     "add": "register",
     "install": "register",
@@ -90,6 +90,8 @@ COMMAND_ALIASES: dict[str, str] = {
     "rm-video": "unregister-video",
     "remove-video": "unregister-video",
     "delete-video": "unregister-video",
+    "inspect": "check",
+    "probe": "check",
     "ls": "list",
     "status": "list",
     "reload": "refresh",
@@ -99,6 +101,14 @@ COMMAND_ALIASES: dict[str, str] = {
     "-v": "version",
     "--version": "version",
 }
+
+# Encode presets for HEVC output (lower CRF / higher bitrate = less loss, larger files).
+QUALITY_PRESETS: dict[str, dict[str, str]] = {
+    "standard": {"vt_bitrate": "20M", "crf": "18", "pix_fmt": "yuv420p", "label": "20 Mbps / CRF 18"},
+    "high": {"vt_bitrate": "40M", "crf": "15", "pix_fmt": "yuv420p", "label": "40 Mbps / CRF 15"},
+    "max": {"vt_bitrate": "60M", "crf": "12", "pix_fmt": "yuv420p10le", "label": "60 Mbps / CRF 12 (10-bit)"},
+}
+DEFAULT_QUALITY = "high"
 
 # ── terminal styling ──────────────────────────────────────────────────────────
 
@@ -314,8 +324,20 @@ def restart_wallpaper_services() -> None:
     info("Restarted WallpaperAgent / cfprefsd — reopen System Settings if it was open.")
 
 
-def needs_transcode(path: Path) -> bool:
-    """Return True unless ffprobe says HEVC in a QuickTime/.mov-friendly tag."""
+def probe_video(path: Path) -> dict[str, Any]:
+    """Return codec/container info and whether macOS aerials can use it as-is."""
+    info_out: dict[str, Any] = {
+        "path": str(path),
+        "ready": False,
+        "needs_transcode": True,
+        "reason": "unreadable",
+        "codec": None,
+        "tag": None,
+        "format": None,
+        "width": None,
+        "height": None,
+        "fps": None,
+    }
     try:
         out = subprocess.check_output(
             [
@@ -325,7 +347,7 @@ def needs_transcode(path: Path) -> bool:
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=codec_name,codec_tag_string:format=format_name",
+                "stream=codec_name,codec_tag_string,width,height,r_frame_rate:format=format_name",
                 "-of",
                 "json",
                 str(path),
@@ -333,21 +355,87 @@ def needs_transcode(path: Path) -> bool:
             text=True,
         )
         meta = json.loads(out)
-        streams = meta.get("streams") or []
-        if not streams:
-            return True
-        codec = (streams[0].get("codec_name") or "").lower()
-        tag = (streams[0].get("codec_tag_string") or "").lower()
-        fmt = (meta.get("format") or {}).get("format_name") or ""
-        if codec in {"hevc", "h265"} and ("mov" in fmt or path.suffix.lower() == ".mov"):
-            # hvc1 is ideal; hev1 often still plays — accept both when already .mov/hevc
-            return False
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
-        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
+        info_out["reason"] = f"ffprobe failed ({e})"
+        return info_out
+
+    streams = meta.get("streams") or []
+    if not streams:
+        info_out["reason"] = "no video stream"
+        return info_out
+
+    stream = streams[0]
+    codec = (stream.get("codec_name") or "").lower()
+    tag = (stream.get("codec_tag_string") or "").lower()
+    fmt = (meta.get("format") or {}).get("format_name") or ""
+    info_out.update(
+        {
+            "codec": codec,
+            "tag": tag,
+            "format": fmt,
+            "width": stream.get("width"),
+            "height": stream.get("height"),
+            "fps": stream.get("r_frame_rate"),
+        }
+    )
+
+    is_hevc = codec in {"hevc", "h265"}
+    # QuickTime / MP4 family — ffprobe often reports "mov,mp4,m4a,..."
+    is_qt_family = (
+        path.suffix.lower() in {".mov", ".mp4", ".m4v"}
+        or "mov" in fmt
+        or "mp4" in fmt
+    )
+    is_mov_ext = path.suffix.lower() == ".mov"
+
+    if not is_hevc:
+        info_out["reason"] = f"codec is {codec or 'unknown'} (aerials want HEVC/H.265)"
+        return info_out
+    if not is_qt_family:
+        info_out["reason"] = f"container is {fmt or path.suffix} (want .mov / MP4 family)"
+        return info_out
+
+    # Ideal: .mov + hvc1. Accept hev1 / mp4+hevc with a note — often works on macOS 26.
+    ready = True
+    notes = []
+    if not is_mov_ext:
+        notes.append("not .mov (usually OK if HEVC; remux to .mov if Settings rejects it)")
+    if tag and tag not in {"hvc1", "hev1", "hvcC"}:
+        notes.append(f"tag is {tag} (hvc1 is ideal)")
+    elif tag == "hev1":
+        notes.append("tag hev1 (hvc1 preferred but usually plays)")
+
+    info_out["ready"] = ready
+    info_out["needs_transcode"] = False
+    info_out["reason"] = "ready for aerials without transcode" + (
+        f" — {'; '.join(notes)}" if notes else ""
+    )
+    return info_out
 
 
-def transcode_or_copy(src: Path, dest: Path, *, force_transcode: bool, skip_transcode: bool) -> bool:
+def needs_transcode(path: Path) -> bool:
+    """Return True unless the file looks aerial-ready (HEVC in QT/MP4 family)."""
+    return bool(probe_video(path).get("needs_transcode", True))
+
+
+def quality_settings(name: str | None) -> dict[str, str]:
+    key = (name or DEFAULT_QUALITY).lower()
+    if key not in QUALITY_PRESETS:
+        die(
+            f"unknown quality “{name}”",
+            hint=f"Choose one of: {', '.join(QUALITY_PRESETS)}",
+        )
+    return QUALITY_PRESETS[key]
+
+
+def transcode_or_copy(
+    src: Path,
+    dest: Path,
+    *,
+    force_transcode: bool,
+    skip_transcode: bool,
+    quality: str = DEFAULT_QUALITY,
+) -> bool:
     """Write dest from src. Returns True if ffmpeg transcode ran."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
@@ -365,7 +453,8 @@ def transcode_or_copy(src: Path, dest: Path, *, force_transcode: bool, skip_tran
             info(f"  copied  {src.name} → {dest.name}")
             return False
 
-    info(f"  transcoding {src.name} → HEVC .mov …")
+    q = quality_settings(quality)
+    info(f"  transcoding {src.name} → HEVC .mov ({q['label']}) …")
     cmd = [
         "ffmpeg",
         "-y",
@@ -377,17 +466,18 @@ def transcode_or_copy(src: Path, dest: Path, *, force_transcode: bool, skip_tran
         "-tag:v",
         "hvc1",
         "-b:v",
-        "12M",
+        q["vt_bitrate"],
         "-pix_fmt",
-        "yuv420p",
+        "yuv420p",  # VT path stays 8-bit for widest compatibility
         "-movflags",
         "+faststart",
         str(dest),
     ]
     r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0 or not dest.exists() or dest.stat().st_size < 1024:
-        # Software fallback
-        info("  videotoolbox failed, trying libx265 …")
+        # Software fallback — can use 10-bit for max
+        pix = q["pix_fmt"] if quality == "max" else "yuv420p"
+        info(f"  videotoolbox failed, trying libx265 (CRF {q['crf']}) …")
         cmd = [
             "ffmpeg",
             "-y",
@@ -399,11 +489,11 @@ def transcode_or_copy(src: Path, dest: Path, *, force_transcode: bool, skip_tran
             "-tag:v",
             "hvc1",
             "-crf",
-            "20",
+            q["crf"],
             "-preset",
-            "medium",
+            "slow" if quality == "max" else "medium",
             "-pix_fmt",
-            "yuv420p",
+            pix,
             "-movflags",
             "+faststart",
             str(dest),
@@ -840,6 +930,7 @@ def cmd_register(args: argparse.Namespace) -> None:
                 dest,
                 force_transcode=args.force_transcode,
                 skip_transcode=args.no_transcode,
+                quality=getattr(args, "quality", DEFAULT_QUALITY),
             )
             make_thumbnail(dest, thumb)
             new_assets.append(
@@ -1140,6 +1231,49 @@ def cmd_list(_: argparse.Namespace) -> None:
         info(S.dim("  Download one built-in aerial in System Settings first."))
 
 
+def cmd_check(args: argparse.Namespace) -> None:
+    """Report whether path(s) can be used as aerials without transcoding."""
+    target = Path(args.path).expanduser().resolve()
+    if not target.exists():
+        die(f"not found: {target}")
+
+    files: list[Path] = []
+    if target.is_file():
+        if target.suffix.lower() not in VIDEO_EXTS:
+            die(f"not a known video type: {target.suffix}")
+        files = [target]
+    elif target.is_dir():
+        videos, _ = scan_folder(target)
+        files = videos
+        if not files:
+            die(f"no video files in {target}")
+    else:
+        die(f"not a file or directory: {target}")
+
+    ready_n = 0
+    for f in files:
+        p = probe_video(f)
+        ready = bool(p.get("ready"))
+        ready_n += int(ready)
+        mark = S.green("ready") if ready else S.yellow("needs transcode")
+        info(f"{S.bold(f.name)}  [{mark}]")
+        info(f"  {p.get('reason')}")
+        dims = ""
+        if p.get("width") and p.get("height"):
+            dims = f"  {p['width']}x{p['height']}"
+        info(
+            f"  codec={p.get('codec') or '?'}  tag={p.get('tag') or '?'}  "
+            f"format={p.get('format') or '?'}{dims}"
+        )
+        if ready:
+            info(f"  tip: register with {S.cyan('--no-transcode')} to avoid re-encoding")
+        else:
+            info(f"  tip: register with {S.cyan(f'--quality {DEFAULT_QUALITY}')} (or max) for less loss")
+        info("")
+
+    info(S.bold(f"{ready_n}/{len(files)} ready without transcode"))
+
+
 def cmd_refresh(_: argparse.Namespace) -> None:
     restart_wallpaper_services()
     ok("Wallpaper services restarted.")
@@ -1172,6 +1306,7 @@ def print_banner_help() -> None:
         ("register", "add", "Register a folder of videos/images"),
         ("unregister", "rm", "Remove a previously registered folder"),
         ("unregister-video", "rm-video", "Remove one source video from Settings"),
+        ("check", "inspect", "See if a video is aerial-ready without transcode"),
         ("list", "ls", "Show what macpaper has registered"),
         ("refresh", "reload", "Restart WallpaperAgent so Settings reloads"),
         ("help", "-h", "Show this help"),
@@ -1182,7 +1317,8 @@ def print_banner_help() -> None:
     print()
     print(f"  {S.bold('Examples')}")
     print(f"    {S.dim('$')} macpaper register ~/Movies/Wallpapers --name \"My Wallpapers\"")
-    print(f"    {S.dim('$')} macpaper register ~/Clips --videos-only")
+    print(f"    {S.dim('$')} macpaper check ~/Movies/clip.mp4")
+    print(f"    {S.dim('$')} macpaper register ~/Clips --quality max")
     print(f"    {S.dim('$')} macpaper list")
     print(f"    {S.dim('$')} macpaper unregister ~/Movies/Wallpapers")
     print(f"    {S.dim('$')} macpaper unregister-video ~/Movies/Wallpapers clip.mp4")
@@ -1385,6 +1521,12 @@ def build_parser() -> MacpaperParser:
     r.add_argument("--images-only", action="store_true", help="Only register the folder for still images")
     r.add_argument("--no-transcode", action="store_true", help="Copy/link as-is (skip HEVC encode)")
     r.add_argument("--force-transcode", action="store_true", help="Always re-encode to HEVC")
+    r.add_argument(
+        "--quality",
+        choices=sorted(QUALITY_PRESETS.keys()),
+        default=DEFAULT_QUALITY,
+        help=f"HEVC encode quality when transcoding (default: {DEFAULT_QUALITY})",
+    )
     save_group = r.add_mutually_exclusive_group()
     save_group.add_argument(
         "--save-transcoded",
@@ -1424,6 +1566,15 @@ def build_parser() -> MacpaperParser:
     uv.add_argument("--no-restart", action="store_true", help="Do not restart WallpaperAgent")
     uv.epilog = "Example:\n  macpaper unregister-video ~/Movies/Wallpapers sunset"
 
+    ck = add_cmd(
+        "check",
+        "Check if videos are aerial-ready without transcoding",
+        cmd_check,
+        aliases=("inspect", "probe"),
+    )
+    ck.add_argument("path", help="Video file or folder to inspect")
+    ck.epilog = "Example:\n  macpaper check ~/Movies/clip.mp4"
+
     add_cmd("list", "List registered folders / custom aerials", cmd_list, aliases=("ls", "status"))
     add_cmd("refresh", "Restart WallpaperAgent so Settings reloads", cmd_refresh, aliases=("reload", "restart"))
     add_cmd("help", "Show help", cmd_help)
@@ -1455,6 +1606,7 @@ def main(argv: list[str] | None = None) -> None:
         "register",
         "unregister",
         "unregister-video",
+        "check",
         "list",
         "refresh",
         "help",
@@ -1467,6 +1619,8 @@ def main(argv: list[str] | None = None) -> None:
         "rm-video",
         "remove-video",
         "delete-video",
+        "inspect",
+        "probe",
         "ls",
         "status",
         "reload",
