@@ -93,26 +93,29 @@ Mistyped commands get “Did you mean …?” hints. Aliases: `add` / `rm` / `ls
 **Videos:** `.mp4` `.mov` `.m4v` `.mkv` `.avi` `.webm` `.mts` `.m2ts`  
 **Images:** `.jpg` `.jpeg` `.png` `.heic` `.heif` `.tif` `.tiff` `.gif` `.webp` `.bmp`
 
-### `unregister <folder>`
+### `unregister <target>`
 
-Remove an entire previously registered folder (all videos + image-folder entry). Asks for confirmation unless `--yes`.
+Remove a registered **folder**, or a **single video** resolved across all registrations.
+
+`<target>` can be a folder path, asset UUID (from `list`), source path, filename, or unique title fragment.
 
 ```bash
 ./macpaper unregister ~/Movies/MyWallpapers
 ./macpaper unregister ~/Movies/MyWallpapers --yes
+./macpaper unregister B5F705B9-5A54-5FBF-B3A3-54EEB78C473D --yes
+./macpaper unregister sunset.mp4 --yes
 ./macpaper unregister ~/Movies/MyWallpapers --force --yes
 ```
 
-### `unregister-video <folder> <video>`
+### `unregister-video [folder] <video>`
 
-Remove **one** source video from Wallpaper / Screen Saver. The name may be a unique partial match (e.g. `sun` → `sunset.mp4`). Asks for confirmation unless `--yes`.
-
-Deletes only that aerial listing, its system encode/thumbnail, and its local `transcoded/` copy if present. Other videos stay.
+Remove **one** video. Folder is optional — without it, macpaper searches every registered folder. Match by asset UUID, path, filename, or unique partial name.
 
 ```bash
+./macpaper unregister-video B5F705B9-5A54-5FBF-B3A3-54EEB78C473D
+./macpaper unregister-video sunset.mp4 --yes
 ./macpaper unregister-video ~/Movies/MyWallpapers sunset.mp4
 ./macpaper rm-video ~/Movies/MyWallpapers sun          # unique partial match
-./macpaper unregister-video ~/Movies/MyWallpapers sun --yes
 ```
 
 ### `check <path>`

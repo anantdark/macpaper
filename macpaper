@@ -42,6 +42,7 @@ import json
 import math
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -51,7 +52,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
@@ -735,30 +736,35 @@ def lookup_folder_state(
     return key, None
 
 
-def match_tracked_asset(
+def looks_like_uuid(token: str) -> bool:
+    """True if token is a UUID string (with or without surrounding path junk)."""
+    s = Path(token.strip()).name
+    return bool(
+        re.fullmatch(
+            r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+            s,
+        )
+    )
+
+
+def collect_asset_matches(
     assets: dict[str, Any], video_name: str
-) -> tuple[str, dict[str, Any]] | None:
-    """Find a tracked asset by exact name/path, or a unique partial match."""
+) -> tuple[list[tuple[str, dict[str, Any]]], list[tuple[str, dict[str, Any]]]]:
+    """Return (exact_matches, partial_matches) for a needle within one folder's assets."""
     needle = video_name.strip()
     if not needle:
-        return None
+        return [], []
     needle_expanded = str(Path(needle).expanduser())
+    try:
+        needle_resolved = normalize_path(Path(needle).expanduser())
+    except (OSError, RuntimeError, ValueError):
+        needle_resolved = str(Path(needle).expanduser())
     needle_base = Path(needle_expanded).name
     needle_stem = Path(needle_expanded).stem
     needle_l = needle.lower()
     needle_base_l = needle_base.lower()
     needle_stem_l = needle_stem.lower()
-
-    def dedupe(pairs: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
-        seen: set[str] = set()
-        out: list[tuple[str, dict[str, Any]]] = []
-        for k, m in pairs:
-            aid = str(m.get("id") or k)
-            if aid in seen:
-                continue
-            seen.add(aid)
-            out.append((k, m))
-        return out
+    needle_id = needle_base.upper()
 
     exact: list[tuple[str, dict[str, Any]]] = []
     partial: list[tuple[str, dict[str, Any]]] = []
@@ -770,15 +776,21 @@ def match_tracked_asset(
         src_name = Path(src).name if src else key
         src_stem = Path(src_name).stem
         title = str(meta.get("title") or "")
+        asset_id = str(meta.get("id") or "")
+        aerial = str(meta.get("aerial") or "")
         key_l, src_l, stem_l, title_l = (
             key.lower(),
             src_name.lower(),
             src_stem.lower(),
             title.lower(),
         )
+        src_norm = normalize_path(src) if src else ""
+        aerial_norm = normalize_path(aerial) if aerial else ""
 
         if (
             needle_expanded == src
+            or needle_resolved == src_norm
+            or (aerial and (needle_resolved == aerial_norm or needle_base == Path(aerial).name))
             or needle == key
             or needle_base == key
             or needle_base == src_name
@@ -786,12 +798,12 @@ def match_tracked_asset(
             or needle_base_l == key_l
             or needle_base_l == src_l
             or needle_stem_l == stem_l
+            or (asset_id and needle_id == asset_id.upper())
         ):
             exact.append((key, meta))
             continue
 
-        # Unique substring / prefix match against filename, stem, or title
-        haystacks = (key_l, src_l, stem_l, title_l)
+        haystacks = (key_l, src_l, stem_l, title_l, asset_id.lower())
         if any(
             needle_l in h or h.startswith(needle_l) or needle_stem_l in h
             for h in haystacks
@@ -799,25 +811,116 @@ def match_tracked_asset(
         ):
             partial.append((key, meta))
 
-    exact_u = dedupe(exact)
+    return exact, partial
+
+
+def _dedupe_asset_pairs(
+    pairs: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[str, dict[str, Any]]]:
+    seen: set[str] = set()
+    out: list[tuple[str, dict[str, Any]]] = []
+    for k, m in pairs:
+        aid = str(m.get("id") or k)
+        if aid in seen:
+            continue
+        seen.add(aid)
+        out.append((k, m))
+    return out
+
+
+def _dedupe_folder_hits(
+    hits: list[tuple[str, str, dict[str, Any]]],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    seen: set[str] = set()
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for folder_key, src_name, meta in hits:
+        aid = str(meta.get("id") or f"{folder_key}:{src_name}")
+        if aid in seen:
+            continue
+        seen.add(aid)
+        out.append((folder_key, src_name, meta))
+    return out
+
+
+def match_tracked_asset(
+    assets: dict[str, Any], video_name: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Find a tracked asset by exact name/path/id, or a unique partial match."""
+    exact, partial = collect_asset_matches(assets, video_name)
+
+    exact_u = _dedupe_asset_pairs(exact)
     if len(exact_u) == 1:
         return exact_u[0]
     if len(exact_u) > 1:
         names = ", ".join(k for k, _ in exact_u)
         die(
             f"ambiguous video “{video_name}” matches: {names}",
-            hint="Pass a more specific filename.",
+            hint="Pass a more specific filename or asset id.",
         )
 
-    partial_u = dedupe(partial)
+    partial_u = _dedupe_asset_pairs(partial)
     if len(partial_u) == 1:
         return partial_u[0]
     if len(partial_u) > 1:
         names = ", ".join(k for k, _ in partial_u)
         die(
             f"ambiguous video “{video_name}” matches: {names}",
-            hint="Narrow the name so it matches only one source (e.g. full filename).",
+            hint="Narrow the name so it matches only one source (e.g. full filename or asset id).",
         )
+    return None
+
+
+def find_video_across_folders(
+    state: dict[str, Any], needle: str
+) -> tuple[str, str, dict[str, Any]] | None:
+    """Resolve needle to a unique (folder_key, source_name, meta) across all registrations."""
+    exact_hits: list[tuple[str, str, dict[str, Any]]] = []
+    partial_hits: list[tuple[str, str, dict[str, Any]]] = []
+
+    for folder_key, prev in (state.get("folders") or {}).items():
+        if not isinstance(prev, dict):
+            continue
+        assets = prev.get("assets") or {}
+        if not isinstance(assets, dict):
+            continue
+        exact, partial = collect_asset_matches(assets, needle)
+        for src_name, meta in exact:
+            exact_hits.append((folder_key, src_name, meta))
+        for src_name, meta in partial:
+            partial_hits.append((folder_key, src_name, meta))
+
+    exact_u = _dedupe_folder_hits(exact_hits)
+    if len(exact_u) == 1:
+        return exact_u[0]
+    if len(exact_u) > 1:
+        desc = ", ".join(f"{s} ({f})" for f, s, _ in exact_u)
+        die(
+            f"ambiguous video “{needle}” matches: {desc}",
+            hint="Pass the asset UUID from macpaper list, or folder + filename.",
+        )
+
+    partial_u = _dedupe_folder_hits(partial_hits)
+    if len(partial_u) == 1:
+        return partial_u[0]
+    if len(partial_u) > 1:
+        desc = ", ".join(f"{s} ({f})" for f, s, _ in partial_u)
+        die(
+            f"ambiguous video “{needle}” matches: {desc}",
+            hint="Pass the asset UUID from macpaper list, or folder + filename.",
+        )
+    return None
+
+
+def resolve_unregister_folder(
+    state: dict[str, Any], token: str
+) -> tuple[str, dict[str, Any]] | None:
+    """If token is a tracked folder path, return (key, prev)."""
+    if looks_like_uuid(token):
+        return None
+    folder = Path(normalize_path(token))
+    key, prev = lookup_folder_state(state, folder)
+    if prev:
+        return key, prev
     return None
 
 
@@ -1149,12 +1252,89 @@ def cmd_register(args: argparse.Namespace) -> None:
 
 
 def cmd_unregister(args: argparse.Namespace) -> None:
-    folder = Path(normalize_path(args.folder))
-    state = load_state()
-    key, prev = lookup_folder_state(state, folder)
+    """Unregister a whole folder, or a single video resolved across registrations.
 
-    if not prev and not args.force:
-        die(f"folder not tracked by macpaper: {folder}", hint="use --force to scrub by path hash anyway")
+    Accepts:
+      - registered folder path → remove entire folder
+      - asset UUID / source path / filename / title → remove that one video
+    """
+    token = str(args.folder).strip()
+    state = load_state()
+
+    folder_hit = resolve_unregister_folder(state, token)
+    if folder_hit:
+        key, prev = folder_hit
+        folder = Path(key)
+        return _unregister_folder(
+            state=state,
+            key=key,
+            prev=prev,
+            folder=folder,
+            force=bool(args.force),
+            assume_yes=getattr(args, "yes", False),
+            no_restart=bool(args.no_restart),
+            dry_run=getattr(args, "dry_run", False),
+        )
+
+    video_hit = find_video_across_folders(state, token)
+    if video_hit:
+        folder_key, src_name, _meta = video_hit
+        info(
+            f"Matched video {S.cyan(src_name)} in {S.cyan(folder_key)} "
+            f"(removing that video only)"
+        )
+        return cmd_unregister_video(
+            argparse.Namespace(
+                folder=folder_key,
+                video=src_name,
+                dry_run=getattr(args, "dry_run", False),
+                yes=getattr(args, "yes", False),
+                no_restart=getattr(args, "no_restart", False),
+            )
+        )
+
+    if args.force and not looks_like_uuid(token):
+        folder = Path(normalize_path(token))
+        key = normalize_path(folder)
+        return _unregister_folder(
+            state=state,
+            key=key,
+            prev=None,
+            folder=folder,
+            force=True,
+            assume_yes=getattr(args, "yes", False),
+            no_restart=bool(args.no_restart),
+            dry_run=getattr(args, "dry_run", False),
+        )
+
+    die(
+        f"nothing registered matching “{token}”",
+        hint=(
+            f"Pass a registered folder path, asset UUID, source path, or filename "
+            f"(see {S.cyan('macpaper list')})."
+        ),
+    )
+
+
+def _unregister_folder(
+    *,
+    state: dict[str, Any],
+    key: str,
+    prev: dict[str, Any] | None,
+    folder: Path,
+    force: bool,
+    assume_yes: bool,
+    no_restart: bool,
+    dry_run: bool,
+) -> None:
+    if not prev and not force:
+        die(
+            f"folder not tracked by macpaper: {folder}",
+            hint=(
+                f"Pass the registered folder path (see {S.cyan('macpaper list')}), "
+                f"an asset UUID / video name, or {S.cyan('--force')}."
+            ),
+        )
 
     category_id = (prev or {}).get("category_id") or deterministic_uuid(f"category:{normalize_path(folder)}")
     subcategory_id = (prev or {}).get("subcategory_id") or deterministic_uuid(
@@ -1166,17 +1346,22 @@ def cmd_unregister(args: argparse.Namespace) -> None:
         f"Unregister entire folder {S.cyan(str(folder))}\n"
         f"  This removes all {n_videos} tracked video(s) and any image-folder registration."
     )
-    if not getattr(args, "dry_run", False):
-        if not confirm_unregister(summary, assume_yes=getattr(args, "yes", False)):
-            info(S.dim("Cancelled."))
-            return
+    if dry_run:
+        info(
+            f"Would unregister folder {folder} "
+            f"({n_videos} video(s), category {category_id})"
+        )
+        return
+
+    if not confirm_unregister(summary, assume_yes=assume_yes):
+        info(S.dim("Cancelled."))
+        return
 
     if ENTRIES.exists():
         entries = load_entries()
         removed = remove_category_assets(entries, category_id, subcategory_id)
         save_entries(entries)
         for aid in removed:
-            # Also drop local transcoded copies recorded in state
             local = None
             if prev:
                 for meta in (prev.get("assets") or {}).values():
@@ -1195,42 +1380,80 @@ def cmd_unregister(args: argparse.Namespace) -> None:
         del state["folders"][key]
         save_state(state)
 
-    if not args.no_restart:
+    if not no_restart:
         restart_wallpaper_services()
     ok("Unregistered folder.")
 
 
 def cmd_unregister_video(args: argparse.Namespace) -> None:
-    """Remove a single source video's aerial listing and encodes only."""
-    folder = Path(normalize_path(args.folder))
-    video_name = args.video
+    """Remove a single source video's aerial listing and encodes only.
+
+    Accepts:
+      - <folder> <video> — scoped lookup
+      - <video|asset-id|path> alone — search all registered folders
+    """
     state = load_state()
-    key, prev = lookup_folder_state(state, folder)
+    folder_arg = getattr(args, "folder", None)
+    video_arg = getattr(args, "video", None)
 
-    if not prev:
+    if folder_arg is None:
         die(
-            f"folder not tracked by macpaper: {folder}",
-            hint=f"Register it first, or check {S.cyan('macpaper list')}.",
+            "missing video target",
+            hint=f"Usage: {S.cyan('macpaper unregister-video <asset-id|path|name>')}\n"
+            f"   or: {S.cyan('macpaper unregister-video <folder> <name>')}",
         )
 
-    assets = dict(prev.get("assets") or {})
-    if not assets:
-        die("no videos tracked for this folder", hint="Nothing to remove.")
+    folder_token = str(folder_arg).strip()
+    video_token = str(video_arg).strip() if video_arg else None
+    query_label = video_token or folder_token
 
-    matched = match_tracked_asset(assets, video_name)
-    if not matched:
-        known = ", ".join(sorted(assets.keys())) or "(none)"
-        die(
-            f"video “{video_name}” not found in macpaper state for this folder",
-            hint=f"Tracked sources: {known}",
-        )
+    if video_token is None:
+        hit = find_video_across_folders(state, folder_token)
+        if not hit:
+            die(
+                f"video “{folder_token}” not found in any registered folder",
+                hint=f"Check {S.cyan('macpaper list')}.",
+            )
+        key, asset_key, meta = hit
+        prev = (state.get("folders") or {}).get(key) or {}
+        info(f"Matched in {S.cyan(key)}")
+    else:
+        folder_hit = resolve_unregister_folder(state, folder_token)
+        if folder_hit:
+            key, prev = folder_hit
+            assets = dict(prev.get("assets") or {})
+            if not assets:
+                die("no videos tracked for this folder", hint="Nothing to remove.")
+            matched = match_tracked_asset(assets, video_token)
+            if not matched:
+                known = ", ".join(sorted(assets.keys())) or "(none)"
+                die(
+                    f"video “{video_token}” not found in macpaper state for this folder",
+                    hint=f"Tracked sources: {known}",
+                )
+            asset_key, meta = matched
+        else:
+            needle = folder_token if looks_like_uuid(folder_token) else video_token
+            hit = find_video_across_folders(state, needle)
+            if not hit and needle != video_token:
+                hit = find_video_across_folders(state, video_token)
+            if not hit:
+                hit = find_video_across_folders(state, folder_token)
+            if not hit:
+                die(
+                    f"video “{query_label}” not found in any registered folder",
+                    hint=f"Check {S.cyan('macpaper list')}.",
+                )
+            key, asset_key, meta = hit
+            prev = (state.get("folders") or {}).get(key) or {}
+            info(f"Matched in {S.cyan(key)}")
 
-    asset_key, meta = matched
     asset_id = meta.get("id")
     if not asset_id:
         die(f"tracked entry for “{asset_key}” has no asset id")
 
     category_id = prev.get("category_id") or deterministic_uuid(f"category:{key}")
+    folder = Path(key)
     local_tc = meta.get("local_transcode")
     if not local_tc:
         candidate = folder / TRANSCODED_DIR_NAME / f"{Path(asset_key).stem}.mov"
@@ -1244,9 +1467,10 @@ def cmd_unregister_video(args: argparse.Namespace) -> None:
         return
 
     summary = f"Unregister video {S.cyan(asset_key)}"
-    if video_name != asset_key:
-        summary += f"  {S.dim(f'(matched from “{video_name}”)')}"
+    if query_label != asset_key:
+        summary += f"  {S.dim(f'(matched from “{query_label}”)')}"
     summary += f"\n  aerial id: {S.dim(str(asset_id))}"
+    summary += f"\n  folder: {S.dim(key)}"
     if local_tc:
         summary += f"\n  local copy: {S.dim(str(local_tc))}"
     summary += "\n  Other videos in this folder will be left alone."
@@ -1266,11 +1490,12 @@ def cmd_unregister_video(args: argparse.Namespace) -> None:
     for path in deleted:
         info(f"Deleted {path}")
 
-    del assets[asset_key]
+    assets = dict(prev.get("assets") or {})
+    if asset_key in assets:
+        del assets[asset_key]
     prev["assets"] = assets
     prev["updated_at"] = datetime.now(timezone.utc).isoformat()
     state.setdefault("folders", {})[key] = prev
-    # If no videos left and no image registration, drop folder state entirely
     if not assets and not prev.get("image_folder_registered"):
         del state["folders"][key]
         info("No media left for this folder — cleared macpaper state entry")
@@ -1279,6 +1504,7 @@ def cmd_unregister_video(args: argparse.Namespace) -> None:
     if not args.no_restart:
         restart_wallpaper_services()
     ok(f"Unregistered video “{asset_key}”. Other videos untouched.")
+
 
 
 def is_macpaper_asset(asset: dict[str, Any], owned_ids: set[str] | None = None) -> bool:
@@ -1463,8 +1689,8 @@ def print_banner_help() -> None:
     print(f"  {S.bold('Commands')}")
     rows = [
         ("register", "add", "Register a folder of videos/images"),
-        ("unregister", "rm", "Remove a previously registered folder"),
-        ("unregister-video", "rm-video", "Remove one source video from Settings"),
+        ("unregister", "rm", "Remove a folder or one video (path / asset id / name)"),
+        ("unregister-video", "rm-video", "Remove one video (searches registered folders)"),
         ("check", "inspect", "See if a video is full aerial-ready (temporal HEVC)"),
         ("list", "ls", "Show what macpaper has registered"),
         ("refresh", "reload", "Restart WallpaperAgent so Settings reloads"),
@@ -1480,7 +1706,8 @@ def print_banner_help() -> None:
     print(f"    {S.dim('$')} macpaper register ~/Clips --quality max")
     print(f"    {S.dim('$')} macpaper list")
     print(f"    {S.dim('$')} macpaper unregister ~/Movies/Wallpapers")
-    print(f"    {S.dim('$')} macpaper unregister-video ~/Movies/Wallpapers clip.mp4")
+    print(f"    {S.dim('$')} macpaper unregister B5F705B9-5A54-5FBF-B3A3-54EEB78C473D")
+    print(f"    {S.dim('$')} macpaper unregister-video sunset.mp4")
     print()
     print(f"  {S.bold('Tips')}")
     print(f"    Run {S.cyan('macpaper <command> --help')} for command-specific flags.")
@@ -1550,16 +1777,28 @@ def interactive_menu() -> list[str]:
 
     argv = [cmd]
     if cmd in {"register", "unregister", "unregister-video"}:
-        folder = _prompt("Folder path")
-        if not folder:
-            die("a folder path is required", hint="Example: ~/Movies/Wallpapers")
-        argv.append(folder)
-        if cmd == "unregister-video":
-            video = _prompt("Source video name (e.g. clip.mp4)")
-            if not video:
-                die("a video name is required", hint="Use the original filename from the folder.")
-            argv.append(video)
-        if cmd == "register":
+        if cmd == "unregister":
+            target = _prompt("Folder path, asset UUID, or video name")
+            if not target:
+                die(
+                    "a target is required",
+                    hint="Example: ~/Movies/Wallpapers  or  B5F705B9-…  or  clip.mp4",
+                )
+            argv.append(target)
+        elif cmd == "unregister-video":
+            target = _prompt("Asset UUID, source path, or video name")
+            if not target:
+                die("a video target is required", hint="Example: clip.mp4 or an asset UUID from list")
+            argv.append(target)
+            folder = _prompt("Limit to folder? (Enter to search all)", "")
+            if folder:
+                # folder + video form
+                argv = [cmd, folder, target]
+        else:
+            folder = _prompt("Folder path")
+            if not folder:
+                die("a folder path is required", hint="Example: ~/Movies/Wallpapers")
+            argv.append(folder)
             name = _prompt("Category name (optional, Enter to skip)", "")
             if name:
                 argv.extend(["--name", name])
@@ -1711,14 +1950,24 @@ def build_parser() -> MacpaperParser:
 
     u = add_cmd(
         "unregister",
-        "Remove a previously registered folder",
+        "Remove a registered folder, or one video (asset id / path / name)",
         cmd_unregister,
         aliases=("rm", "remove", "delete"),
     )
-    u.add_argument("folder", help="Folder previously passed to register")
+    u.add_argument(
+        "folder",
+        help="Registered folder path, or asset UUID / source path / filename to remove one video",
+    )
     u.add_argument("--force", action="store_true", help="Scrub even if not in macpaper state")
     u.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    u.add_argument("--dry-run", action="store_true", help="Show what would be removed")
     u.add_argument("--no-restart", action="store_true", help="Do not restart WallpaperAgent")
+    u.epilog = (
+        "Examples:\n"
+        "  macpaper unregister ~/Movies/Wallpapers\n"
+        "  macpaper unregister B5F705B9-5A54-5FBF-B3A3-54EEB78C473D\n"
+        "  macpaper unregister sunset.mp4"
+    )
 
     uv = add_cmd(
         "unregister-video",
@@ -1726,12 +1975,25 @@ def build_parser() -> MacpaperParser:
         cmd_unregister_video,
         aliases=("rm-video", "remove-video", "delete-video"),
     )
-    uv.add_argument("folder", help="Folder previously passed to register")
-    uv.add_argument("video", help="Source video name (exact or unique partial match)")
+    uv.add_argument(
+        "folder",
+        help="Registered folder, or alone: asset UUID / source path / filename",
+    )
+    uv.add_argument(
+        "video",
+        nargs="?",
+        default=None,
+        help="Source video name when folder is given (optional if folder is an id/path/name)",
+    )
     uv.add_argument("--dry-run", action="store_true", help="Show what would be removed")
     uv.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     uv.add_argument("--no-restart", action="store_true", help="Do not restart WallpaperAgent")
-    uv.epilog = "Example:\n  macpaper unregister-video ~/Movies/Wallpapers sunset"
+    uv.epilog = (
+        "Examples:\n"
+        "  macpaper unregister-video B5F705B9-5A54-5FBF-B3A3-54EEB78C473D\n"
+        "  macpaper unregister-video ~/Movies/clip.mp4\n"
+        "  macpaper unregister-video ~/Movies/Wallpapers sunset"
+    )
 
     ck = add_cmd(
         "check",

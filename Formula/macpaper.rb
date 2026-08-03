@@ -1,10 +1,10 @@
 class Macpaper < Formula
   desc "Register local videos and images in macOS Wallpaper and Screen Saver"
   homepage "https://github.com/anantdark/macpaper"
-  url "https://github.com/anantdark/macpaper/archive/refs/tags/v1.4.1.tar.gz"
-  sha256 "cc0f36e000560fb1d80c44587eaeed610f8788c0fe8226040222e2028cc4bc88"
+  url "https://github.com/anantdark/macpaper/archive/refs/tags/v1.4.2.tar.gz"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "GPL-3.0-or-later"
-  version "1.4.1"
+  version "1.4.2"
 
   depends_on "ffmpeg"
   depends_on :macos
