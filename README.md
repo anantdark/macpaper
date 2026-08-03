@@ -7,8 +7,8 @@ Uses only Apple system paths and its own data directory. No other wallpaper apps
 ## Requirements
 
 - macOS 26 (Tahoe) or later
-- [ffmpeg](https://ffmpeg.org/) on `PATH` (`brew install ffmpeg`)
-- Xcode Command Line Tools (one-time compile of the image-folder helper)
+- [ffmpeg](https://ffmpeg.org/) on `PATH` (`brew install ffmpeg`) — thumbnails + probe
+- Xcode Command Line Tools (compiles `encode_temporal` + image-folder helper on first use)
 - At least one built-in Apple aerial downloaded once in System Settings (creates the aerial manifest)
 
 ## Install
@@ -76,9 +76,9 @@ Mistyped commands get “Did you mean …?” hints. Aliases: `add` / `rm` / `ls
 | `--name NAME` | Category name in Wallpaper settings (default: folder name) |
 | `--videos-only` | Only register videos as live aerials |
 | `--images-only` | Only register the folder for still images |
-| `--no-transcode` | Always copy/link as-is (even if check says not ready) |
-| `--force-transcode` | Always re-encode, even if already aerial-ready |
-| `--quality {standard,high,max}` | Encode quality when transcoding (default: `high`) |
+| `--no-transcode` | Always copy/link as-is (screensaver may work; wallpaper freeze usually won’t) |
+| `--force-transcode` | Always re-encode with temporal layers (fixes already-registered clips) |
+| `--quality {standard,high,max}` | Temporal HEVC bitrate when encoding (default: `high`) |
 | `--save-transcoded` | Also copy encodes into `<folder>/transcoded/` |
 | `--no-save-transcoded` | Skip the save prompt; don’t write local copies |
 | `--no-restart` | Don’t restart WallpaperAgent (batch, then `refresh`) |
@@ -117,7 +117,7 @@ Deletes only that aerial listing, its system encode/thumbnail, and its local `tr
 
 ### `check <path>`
 
-Inspect a video file or folder and report whether each clip is **aerial-ready without transcoding** (HEVC in a `.mov`/MP4-family container).
+Inspect a video file or folder and report whether each clip is **full aerial-ready**: HEVC in a `.mov`/MP4-family container **with temporal sub-layers** (`tscl`/`tsas`).
 
 ```bash
 ./macpaper check ~/Movies/clip.mp4
@@ -125,10 +125,19 @@ Inspect a video file or folder and report whether each clip is **aerial-ready wi
 ./macpaper inspect ~/Movies/clip.mp4
 ```
 
-If it says **ready**, register with `--no-transcode` to avoid re-encoding. If it **needs transcode**, use `--quality high` (default) or `--quality max` for less loss.
+| Result | Meaning |
+|--------|---------|
+| **ready** | Screensaver + stop-screensaver → wallpaper freeze |
+| **screensaver only** | Plain HEVC — plays as aerial screensaver, but wallpaper ramp fails |
+| **needs encode** | Not HEVC / wrong container — will be encoded on register |
 
-`register` runs this same check automatically per file and skips encoding when ready (unless `--force-transcode`).
+`register` runs this check per file. Plain HEVC is re-encoded with VideoToolbox temporal layers so wallpaper freeze works. Skip only when already full-ready (unless `--force-transcode`).
 
+Re-fix clips registered with older macpaper (ffmpeg-only HEVC):
+
+```bash
+./macpaper register ~/Movies/MyWallpapers --force-transcode
+```
 ### `list`
 
 Shows only what macpaper manages (not other apps’ custom aerials).
@@ -141,15 +150,17 @@ Restarts `WallpaperAgent` / `cfprefsd` so System Settings reloads.
 
 **Videos** — published through macOS’s built-in aerial catalog (`WallpaperAerialsExtension`):
 
-1. Probe each video (same as `check`); skip encode when already aerial-ready
-2. Otherwise transcode to HEVC `.mov` (`hvc1`) with `--quality standard|high|max`
-3. Store under `~/Library/Application Support/com.apple.wallpaper/aerials/videos/`
-4. Write PNG thumbnails under `…/aerials/thumbnails/`
-5. Patch `…/aerials/manifest/entries.json` with a macpaper category and `file://` URLs
-6. Restart WallpaperAgent
+1. Probe each video (same as `check`); skip encode when already full-ready (HEVC + temporal layers)
+2. Otherwise encode with VideoToolbox **Main10 + temporal sub-layers** (`BaseLayerFrameRate`) via `helpers/encode_temporal.swift` — ffmpeg cannot emit the `tscl`/`tsas` sample groups WallpaperAgent needs for unlock / stop-screensaver → wallpaper. Slower sources are frame-held up to **240 fps** (Apple aerial cadence) so the unlock ramp has matching timing.
+3. Short clips are looped in the encode to ~5 minutes (Apple aerial length) so freeze/looping behaves
+4. Store under `~/Library/Application Support/com.apple.wallpaper/aerials/videos/`
+5. Write PNG thumbnails under `…/aerials/thumbnails/`
+6. Patch `…/aerials/manifest/entries.json` with a macpaper category and `file://` URLs
+7. Restart WallpaperAgent
 
 Use `macpaper check <file>` to inspect without registering.
 
+Temporal encoder adapted from [macos-custom-video-wallpaper-fix](https://github.com/AlexisBCD/macos-custom-video-wallpaper-fix) (MIT).
 **Images** — register the folder with WallpaperImageExtension (same idea as “Add Folder…” in Settings).
 
 **macpaper-only state:** `~/Library/Application Support/macpaper/`  

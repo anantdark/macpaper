@@ -21,7 +21,8 @@ Standalone CLI. Talks only to Apple system paths and its own support directory:
 Videos are published through macOS's built-in aerial wallpaper catalog
 (WallpaperAerialsExtension) on macOS 26+:
 
-  1. Transcode to HEVC .mov (hvc1) when needed
+  1. Encode to HEVC .mov with temporal sub-layers (tscl/tsas) via VideoToolbox
+     — required so stopping the screensaver can freeze that frame as wallpaper
   2. Store under ~/Library/Application Support/com.apple.wallpaper/aerials/videos/
   3. Write PNG thumbnails under .../aerials/thumbnails/
   4. Patch .../aerials/manifest/entries.json with a macpaper category + file:// URLs
@@ -38,6 +39,7 @@ import argparse
 import base64
 import difflib
 import json
+import math
 import os
 import plistlib
 import shutil
@@ -49,7 +51,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
@@ -71,8 +73,16 @@ ENTRIES = MANIFEST_DIR / "entries.json"
 
 SUPPORT = HOME / "Library/Application Support/macpaper"
 STATE_PATH = SUPPORT / "state.json"
-HELPER_SRC = Path(__file__).resolve().parent / "helpers" / "ImageFolderHelper.swift"
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+HELPER_SRC = HELPERS_DIR / "ImageFolderHelper.swift"
 HELPER_BIN = SUPPORT / "bin" / "ImageFolderHelper"
+ENCODE_TEMPORAL_SRC = HELPERS_DIR / "encode_temporal.swift"
+ENCODE_TEMPORAL_BIN = SUPPORT / "bin" / "encode_temporal"
+
+# Apple aerials are ~5–8 min; short clips fail wallpaper freeze / unlock ramp looping.
+TARGET_AERIAL_SECONDS = 300
+# Native aerials are typically 240 fps; we frame-hold slower sources up to this rate.
+TARGET_AERIAL_FPS = 240
 
 IMAGE_PLIST = (
     HOME
@@ -102,11 +112,30 @@ COMMAND_ALIASES: dict[str, str] = {
     "--version": "version",
 }
 
-# Encode presets for HEVC output (lower CRF / higher bitrate = less loss, larger files).
+# Encode presets for temporal HEVC (VideoToolbox Main10 + BaseLayerFrameRate).
+# mbps feeds encode_temporal; vt_bitrate/crf kept only for rare ffmpeg fallback.
 QUALITY_PRESETS: dict[str, dict[str, str]] = {
-    "standard": {"vt_bitrate": "20M", "crf": "18", "pix_fmt": "yuv420p", "label": "20 Mbps / CRF 18"},
-    "high": {"vt_bitrate": "40M", "crf": "15", "pix_fmt": "yuv420p", "label": "40 Mbps / CRF 15"},
-    "max": {"vt_bitrate": "60M", "crf": "12", "pix_fmt": "yuv420p10le", "label": "60 Mbps / CRF 12 (10-bit)"},
+    "standard": {
+        "mbps": "12",
+        "vt_bitrate": "12M",
+        "crf": "18",
+        "pix_fmt": "yuv420p",
+        "label": "12 Mbps Main10 + temporal layers",
+    },
+    "high": {
+        "mbps": "20",
+        "vt_bitrate": "20M",
+        "crf": "15",
+        "pix_fmt": "yuv420p",
+        "label": "20 Mbps Main10 + temporal layers",
+    },
+    "max": {
+        "mbps": "40",
+        "vt_bitrate": "40M",
+        "crf": "12",
+        "pix_fmt": "yuv420p10le",
+        "label": "40 Mbps Main10 + temporal layers",
+    },
 }
 DEFAULT_QUALITY = "high"
 
@@ -324,12 +353,50 @@ def restart_wallpaper_services() -> None:
     info("Restarted WallpaperAgent / cfprefsd — reopen System Settings if it was open.")
 
 
+def has_temporal_layers(path: Path) -> bool:
+    """True if the file has HEVC temporal sample groups (tscl + tsas).
+
+    WallpaperAgent's unlock / stop-screensaver ramp requires these; plain HEVC
+    from ffmpeg plays as screensaver but cannot freeze the frame as wallpaper.
+    """
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return False
+        with path.open("rb") as f:
+            head_n = min(size, 8_000_000)
+            head = f.read(head_n)
+            if size <= head_n:
+                data = head
+            else:
+                f.seek(max(0, size - 12_000_000))
+                data = head + f.read()
+        return b"tscl" in data and b"tsas" in data
+    except OSError:
+        return False
+
+
+def aerial_loop_count(duration_sec: float | None) -> int:
+    """Loop short clips so the encode is long enough for wallpaper freeze."""
+    if not duration_sec or duration_sec <= 0:
+        return 1
+    if duration_sec >= TARGET_AERIAL_SECONDS:
+        return 1
+    return max(1, int(math.ceil(TARGET_AERIAL_SECONDS / duration_sec)))
+
+
 def probe_video(path: Path) -> dict[str, Any]:
-    """Return codec/container info and whether macOS aerials can use it as-is."""
+    """Return codec/container info and whether the file is full aerial-ready.
+
+    Full ready = HEVC in QT/MP4 family + temporal sub-layers (tscl/tsas).
+    HEVC without temporal layers works as screensaver only.
+    """
     info_out: dict[str, Any] = {
         "path": str(path),
         "ready": False,
         "needs_transcode": True,
+        "screensaver_ok": False,
+        "has_temporal": False,
         "reason": "unreadable",
         "codec": None,
         "tag": None,
@@ -337,6 +404,7 @@ def probe_video(path: Path) -> dict[str, Any]:
         "width": None,
         "height": None,
         "fps": None,
+        "duration": None,
     }
     try:
         out = subprocess.check_output(
@@ -347,7 +415,8 @@ def probe_video(path: Path) -> dict[str, Any]:
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=codec_name,codec_tag_string,width,height,r_frame_rate:format=format_name",
+                "stream=codec_name,codec_tag_string,width,height,r_frame_rate"
+                ":format=format_name,duration",
                 "-of",
                 "json",
                 str(path),
@@ -367,7 +436,13 @@ def probe_video(path: Path) -> dict[str, Any]:
     stream = streams[0]
     codec = (stream.get("codec_name") or "").lower()
     tag = (stream.get("codec_tag_string") or "").lower()
-    fmt = (meta.get("format") or {}).get("format_name") or ""
+    fmt_meta = meta.get("format") or {}
+    fmt = fmt_meta.get("format_name") or ""
+    duration: float | None = None
+    try:
+        duration = float(fmt_meta.get("duration") or 0) or None
+    except (TypeError, ValueError):
+        duration = None
     info_out.update(
         {
             "codec": codec,
@@ -376,6 +451,7 @@ def probe_video(path: Path) -> dict[str, Any]:
             "width": stream.get("width"),
             "height": stream.get("height"),
             "fps": stream.get("r_frame_rate"),
+            "duration": duration,
         }
     )
 
@@ -395,8 +471,10 @@ def probe_video(path: Path) -> dict[str, Any]:
         info_out["reason"] = f"container is {fmt or path.suffix} (want .mov / MP4 family)"
         return info_out
 
-    # Ideal: .mov + hvc1. Accept hev1 / mp4+hevc with a note — often works on macOS 26.
-    ready = True
+    info_out["screensaver_ok"] = True
+    temporal = has_temporal_layers(path)
+    info_out["has_temporal"] = temporal
+
     notes = []
     if not is_mov_ext:
         notes.append("not .mov (usually OK if HEVC; remux to .mov if Settings rejects it)")
@@ -405,16 +483,27 @@ def probe_video(path: Path) -> dict[str, Any]:
     elif tag == "hev1":
         notes.append("tag hev1 (hvc1 preferred but usually plays)")
 
-    info_out["ready"] = ready
+    if not temporal:
+        info_out["ready"] = False
+        info_out["needs_transcode"] = True
+        info_out["reason"] = (
+            "HEVC OK for screensaver, but missing temporal layers "
+            "(tscl/tsas) — wallpaper freeze / unlock ramp needs encode_temporal"
+        )
+        if notes:
+            info_out["reason"] += f" — {'; '.join(notes)}"
+        return info_out
+
+    info_out["ready"] = True
     info_out["needs_transcode"] = False
-    info_out["reason"] = "ready for aerials without transcode" + (
+    info_out["reason"] = "ready for screensaver + wallpaper freeze" + (
         f" — {'; '.join(notes)}" if notes else ""
     )
     return info_out
 
 
 def needs_transcode(path: Path) -> bool:
-    """Return True unless the file looks aerial-ready (HEVC in QT/MP4 family)."""
+    """Return True unless the file is full aerial-ready (HEVC + temporal layers)."""
     return bool(probe_video(path).get("needs_transcode", True))
 
 
@@ -428,6 +517,63 @@ def quality_settings(name: str | None) -> dict[str, str]:
     return QUALITY_PRESETS[key]
 
 
+def ensure_encode_temporal() -> Path:
+    """Compile the VideoToolbox temporal HEVC encoder on demand."""
+    ENCODE_TEMPORAL_BIN.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        ENCODE_TEMPORAL_BIN.exists()
+        and ENCODE_TEMPORAL_SRC.exists()
+        and ENCODE_TEMPORAL_BIN.stat().st_mtime >= ENCODE_TEMPORAL_SRC.stat().st_mtime
+    ):
+        return ENCODE_TEMPORAL_BIN
+    if not ENCODE_TEMPORAL_SRC.exists():
+        die(f"Swift encoder missing: {ENCODE_TEMPORAL_SRC}")
+    info("Compiling encode_temporal (one-time)…")
+    r = subprocess.run(
+        ["swiftc", "-O", "-o", str(ENCODE_TEMPORAL_BIN), str(ENCODE_TEMPORAL_SRC)],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        die(
+            f"swiftc failed for encode_temporal:\n{r.stderr}",
+            hint="Install Xcode Command Line Tools: xcode-select --install",
+        )
+    return ENCODE_TEMPORAL_BIN
+
+
+def encode_temporal_hevc(
+    src: Path,
+    dest: Path,
+    *,
+    quality: str = DEFAULT_QUALITY,
+    duration: float | None = None,
+    target_fps: int = TARGET_AERIAL_FPS,
+    loops: int | None = None,
+) -> None:
+    """Encode with temporal sub-layers so wallpaper freeze / unlock ramp works."""
+    q = quality_settings(quality)
+    loop_n = aerial_loop_count(duration) if loops is None else max(1, loops)
+    mbps = q["mbps"]
+    encoder = ensure_encode_temporal()
+    loop_note = f", looping ×{loop_n} (~{TARGET_AERIAL_SECONDS}s)" if loop_n > 1 else ""
+    fps_note = f", target {target_fps} fps" if target_fps else ""
+    info(f"  encoding {src.name} → temporal HEVC ({q['label']}{loop_note}{fps_note}) …")
+    r = subprocess.run(
+        [str(encoder), str(src), str(dest), str(loop_n), mbps, str(target_fps)],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0 or not dest.exists() or dest.stat().st_size < 1024:
+        err = (r.stderr or r.stdout or "").strip()[-2000:]
+        die(f"encode_temporal failed for {src.name}:\n{err}")
+    if not has_temporal_layers(dest):
+        die(
+            f"encode_temporal wrote {dest.name} but tscl/tsas are missing",
+            hint="Wallpaper freeze will not work; file a bug with macOS / hardware details",
+        )
+
+
 def transcode_or_copy(
     src: Path,
     dest: Path,
@@ -436,10 +582,11 @@ def transcode_or_copy(
     skip_transcode: bool,
     quality: str = DEFAULT_QUALITY,
 ) -> bool:
-    """Write dest from src. Returns True if ffmpeg transcode ran.
+    """Write dest from src. Returns True if a re-encode ran.
 
-    Automatically probes the file (same criteria as `macpaper check`). If it is
-    already aerial-ready, links/copies without re-encoding unless --force-transcode.
+    Probes like `macpaper check`. Skips encode only when HEVC already has
+    temporal layers (unless --force-transcode). Otherwise uses encode_temporal
+    (VideoToolbox Main10 + BaseLayerFrameRate) — ffmpeg alone cannot emit tscl/tsas.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
@@ -454,13 +601,18 @@ def transcode_or_copy(
     elif skip_transcode:
         do_transcode = False
         info(f"  check: {S.dim('skip encode (--no-transcode)')} — {probe.get('reason')}")
+        if probe.get("screensaver_ok") and not probe.get("has_temporal"):
+            warn(
+                "  skipping temporal encode — screensaver will work; "
+                "wallpaper freeze / unlock ramp will not"
+            )
     elif ready:
         do_transcode = False
         info(f"  check: {S.green('ready')} — skipping transcode")
         info(f"  {S.dim(str(probe.get('reason')))}")
     else:
         do_transcode = True
-        info(f"  check: {S.yellow('needs transcode')} — {probe.get('reason')}")
+        info(f"  check: {S.yellow('needs encode')} — {probe.get('reason')}")
 
     if not do_transcode:
         # Prefer hardlink to save disk; fall back to copy.
@@ -473,54 +625,12 @@ def transcode_or_copy(
             info(f"  copied  {src.name} → {dest.name}")
             return False
 
-    q = quality_settings(quality)
-    info(f"  transcoding {src.name} → HEVC .mov ({q['label']}) …")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(src),
-        "-an",
-        "-c:v",
-        "hevc_videotoolbox",
-        "-tag:v",
-        "hvc1",
-        "-b:v",
-        q["vt_bitrate"],
-        "-pix_fmt",
-        "yuv420p",  # VT path stays 8-bit for widest compatibility
-        "-movflags",
-        "+faststart",
-        str(dest),
-    ]
-    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    if r.returncode != 0 or not dest.exists() or dest.stat().st_size < 1024:
-        # Software fallback — can use 10-bit for max
-        pix = q["pix_fmt"] if quality == "max" else "yuv420p"
-        info(f"  videotoolbox failed, trying libx265 (CRF {q['crf']}) …")
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(src),
-            "-an",
-            "-c:v",
-            "libx265",
-            "-tag:v",
-            "hvc1",
-            "-crf",
-            q["crf"],
-            "-preset",
-            "slow" if quality == "max" else "medium",
-            "-pix_fmt",
-            pix,
-            "-movflags",
-            "+faststart",
-            str(dest),
-        ]
-        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        if r.returncode != 0 or not dest.exists():
-            die(f"ffmpeg failed for {src.name}:\n{r.stderr[-2000:]}")
+    encode_temporal_hevc(
+        src,
+        dest,
+        quality=quality,
+        duration=probe.get("duration") if isinstance(probe.get("duration"), (int, float)) else None,
+    )
     return True
 
 
@@ -1259,7 +1369,7 @@ def cmd_list(_: argparse.Namespace) -> None:
 
 
 def cmd_check(args: argparse.Namespace) -> None:
-    """Report whether path(s) can be used as aerials without transcoding."""
+    """Report whether path(s) are full aerial-ready (HEVC + temporal layers)."""
     target = Path(args.path).expanduser().resolve()
     if not target.exists():
         die(f"not found: {target}")
@@ -1278,27 +1388,49 @@ def cmd_check(args: argparse.Namespace) -> None:
         die(f"not a file or directory: {target}")
 
     ready_n = 0
+    screensaver_n = 0
     for f in files:
         p = probe_video(f)
         ready = bool(p.get("ready"))
+        ss_ok = bool(p.get("screensaver_ok"))
         ready_n += int(ready)
-        mark = S.green("ready") if ready else S.yellow("needs transcode")
+        screensaver_n += int(ss_ok)
+        if ready:
+            mark = S.green("ready")
+        elif ss_ok:
+            mark = S.yellow("screensaver only")
+        else:
+            mark = S.yellow("needs encode")
         info(f"{S.bold(f.name)}  [{mark}]")
         info(f"  {p.get('reason')}")
         dims = ""
         if p.get("width") and p.get("height"):
             dims = f"  {p['width']}x{p['height']}"
+        temporal = "yes" if p.get("has_temporal") else "no"
+        dur = p.get("duration")
+        dur_s = f"  duration={dur:.1f}s" if isinstance(dur, (int, float)) else ""
         info(
             f"  codec={p.get('codec') or '?'}  tag={p.get('tag') or '?'}  "
-            f"format={p.get('format') or '?'}{dims}"
+            f"format={p.get('format') or '?'}{dims}  temporal={temporal}{dur_s}"
         )
         if ready:
             info(f"  tip: register with {S.cyan('--no-transcode')} to avoid re-encoding")
+        elif ss_ok:
+            info(
+                f"  tip: register (default) re-encodes with temporal layers so "
+                f"stop-screensaver → wallpaper works; use {S.cyan('--force-transcode')} "
+                f"to refresh already-registered clips"
+            )
         else:
-            info(f"  tip: register with {S.cyan(f'--quality {DEFAULT_QUALITY}')} (or max) for less loss")
+            info(f"  tip: register with {S.cyan(f'--quality {DEFAULT_QUALITY}')} (or max)")
         info("")
 
-    info(S.bold(f"{ready_n}/{len(files)} ready without transcode"))
+    info(
+        S.bold(
+            f"{ready_n}/{len(files)} full ready (screensaver + wallpaper freeze); "
+            f"{screensaver_n}/{len(files)} HEVC for screensaver"
+        )
+    )
 
 
 def cmd_refresh(_: argparse.Namespace) -> None:
@@ -1333,7 +1465,7 @@ def print_banner_help() -> None:
         ("register", "add", "Register a folder of videos/images"),
         ("unregister", "rm", "Remove a previously registered folder"),
         ("unregister-video", "rm-video", "Remove one source video from Settings"),
-        ("check", "inspect", "See if a video is aerial-ready without transcode"),
+        ("check", "inspect", "See if a video is full aerial-ready (temporal HEVC)"),
         ("list", "ls", "Show what macpaper has registered"),
         ("refresh", "reload", "Restart WallpaperAgent so Settings reloads"),
         ("help", "-h", "Show this help"),
@@ -1546,13 +1678,21 @@ def build_parser() -> MacpaperParser:
     r.add_argument("--name", help="Category name in Wallpaper settings (default: folder name)")
     r.add_argument("--videos-only", action="store_true", help="Only register videos as aerials")
     r.add_argument("--images-only", action="store_true", help="Only register the folder for still images")
-    r.add_argument("--no-transcode", action="store_true", help="Copy/link as-is (skip HEVC encode)")
-    r.add_argument("--force-transcode", action="store_true", help="Always re-encode to HEVC")
+    r.add_argument(
+        "--no-transcode",
+        action="store_true",
+        help="Copy/link as-is (skip temporal HEVC encode; wallpaper freeze may not work)",
+    )
+    r.add_argument(
+        "--force-transcode",
+        action="store_true",
+        help="Always re-encode with temporal layers (needed to fix already-registered clips)",
+    )
     r.add_argument(
         "--quality",
         choices=sorted(QUALITY_PRESETS.keys()),
         default=DEFAULT_QUALITY,
-        help=f"HEVC encode quality when transcoding (default: {DEFAULT_QUALITY})",
+        help=f"Temporal HEVC bitrate preset when encoding (default: {DEFAULT_QUALITY})",
     )
     save_group = r.add_mutually_exclusive_group()
     save_group.add_argument(
@@ -1595,12 +1735,16 @@ def build_parser() -> MacpaperParser:
 
     ck = add_cmd(
         "check",
-        "Check if videos are aerial-ready without transcoding",
+        "Check if videos are full aerial-ready (HEVC + temporal layers)",
         cmd_check,
         aliases=("inspect", "probe"),
     )
     ck.add_argument("path", help="Video file or folder to inspect")
-    ck.epilog = "Example:\n  macpaper check ~/Movies/clip.mp4"
+    ck.epilog = (
+        "Full ready = HEVC with temporal sub-layers (tscl/tsas).\n"
+        "Plain HEVC works as screensaver only; wallpaper freeze needs re-encode.\n"
+        "Example:\n  macpaper check ~/Movies/clip.mp4"
+    )
 
     add_cmd("list", "List registered folders / custom aerials", cmd_list, aliases=("ls", "status"))
     add_cmd("refresh", "Restart WallpaperAgent so Settings reloads", cmd_refresh, aliases=("reload", "restart"))
