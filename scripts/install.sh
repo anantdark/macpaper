@@ -26,3 +26,5 @@ brew install "${FORMULA}" </dev/null
 echo
 echo "Done. Try:  macpaper version"
 echo "Help:       macpaper"
+
+# v1.4.1 installer
