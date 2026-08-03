@@ -94,12 +94,14 @@ First run may take a few minutes per video while macpaper encodes them the way m
 | `--name NAME` | Name shown in Settings (default: folder name) |
 | `--videos-only` | Only live aerial videos |
 | `--images-only` | Only still-image folder registration |
-| `--force-transcode` | Re-encode everything (fix older clips / wallpaper freeze) |
+| `--force-transcode` | Re-encode everything, even clips already cached |
 | `--no-transcode` | Skip encode (screensaver may work; freeze often won’t) |
 | `--quality {standard,high,max}` | Encode bitrate preset (default: `high`) |
 | `--loop-to SECONDS` | Loop short clips during encode to at least SECONDS (default: `0` / off; `300` mimics Apple length — slow) |
 | `--save-transcoded` | Also keep copies under `<folder>/transcoded/` |
 | `--dry-run` | Preview only |
+
+Re-running `register` on the same folder **keeps** already-encoded aerials and only encodes new or changed files (source newer than cache). Use `--force-transcode` to redo everything.
 
 **Videos:** `.mp4` `.mov` `.m4v` `.mkv` `.avi` `.webm` `.mts` `.m2ts`  
 **Images:** `.jpg` `.jpeg` `.png` `.heic` `.heif` `.tif` `.tiff` `.gif` `.webp` `.bmp`

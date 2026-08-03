@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
@@ -595,6 +595,24 @@ def encode_temporal_hevc(
             f"encode_temporal wrote {dest.name} but tscl/tsas are missing",
             hint="Wallpaper freeze will not work; file a bug with macOS / hardware details",
         )
+
+
+def aerial_cache_reusable(dest: Path, src: Path, *, force: bool) -> bool:
+    """True if dest is already a temporal aerial for this source — skip re-encode.
+
+    Reuses the cached file under aerials/videos/ when present, temporal-ready,
+    and not older than the source. --force-transcode disables reuse.
+    """
+    if force:
+        return False
+    try:
+        if not dest.is_file() or dest.stat().st_size < 1024:
+            return False
+        if src.stat().st_mtime > dest.stat().st_mtime + 1.0:
+            return False
+    except OSError:
+        return False
+    return has_temporal_layers(dest)
 
 
 def transcode_or_copy(
@@ -1160,49 +1178,71 @@ def cmd_register(args: argparse.Namespace) -> None:
         if save_transcoded:
             info(f"Local copies will be saved under {folder / TRANSCODED_DIR_NAME}/")
 
-        # Drop previous registration for this folder
+        # Rebuild this folder's category; keep cached encodes for files still present.
         prev = state.get("folders", {}).get(key, {})
+        prev_assets: dict[str, Any] = dict(prev.get("assets") or {})
         old_cat = prev.get("category_id", category_id)
         old_sub = prev.get("subcategory_id", subcategory_id)
+        keep_ids = {
+            deterministic_uuid(f"asset:{key}:{src.name}") for src in videos
+        }
         removed = remove_category_assets(entries, old_cat, old_sub)
         for aid in removed:
+            if aid in keep_ids:
+                continue  # reuse cached .mov / thumbnail
             for p in (VIDEOS_DIR / f"{aid}.mov", THUMBS_DIR / f"{aid}.png"):
                 if p.exists():
                     p.unlink()
 
         new_assets: list[dict[str, Any]] = []
+        reused_n = 0
+        encoded_n = 0
         for i, src in enumerate(videos):
             asset_id = deterministic_uuid(f"asset:{key}:{src.name}")
             dest = VIDEOS_DIR / f"{asset_id}.mov"
             thumb = THUMBS_DIR / f"{asset_id}.png"
             title = display_title(src)
             info(f"[{i + 1}/{len(videos)}] {src.name}")
-            if args.dry_run:
-                probe = probe_video(src)
-                loop_to = int(getattr(args, "loop_to", DEFAULT_LOOP_TO_SECONDS) or 0)
-                if args.force_transcode:
-                    info(f"  would force-transcode ({getattr(args, 'quality', DEFAULT_QUALITY)})")
-                elif args.no_transcode or probe.get("ready"):
-                    info(f"  would skip transcode — {probe.get('reason')}")
-                else:
-                    info(f"  would transcode — {probe.get('reason')}")
-                    if loop_to > 0:
-                        n = aerial_loop_count(probe.get("duration"), loop_to_seconds=loop_to)
-                        if n > 1:
-                            info(f"  would loop ×{n} to ~{loop_to}s")
-                registered_assets[src.name] = {"id": asset_id, "title": title, "kind": "video"}
-                if save_transcoded:
-                    info(f"  would save {TRANSCODED_DIR_NAME}/{src.stem}.mov")
-                continue
-            transcode_or_copy(
-                src,
-                dest,
-                force_transcode=args.force_transcode,
-                skip_transcode=args.no_transcode,
-                quality=getattr(args, "quality", DEFAULT_QUALITY),
-                loop_to_seconds=int(getattr(args, "loop_to", DEFAULT_LOOP_TO_SECONDS) or 0),
+            reuse = aerial_cache_reusable(
+                dest, src, force=bool(args.force_transcode)
             )
-            make_thumbnail(dest, thumb)
+            if args.dry_run:
+                if reuse:
+                    info("  would keep existing aerial encode")
+                else:
+                    probe = probe_video(src)
+                    loop_to = int(getattr(args, "loop_to", DEFAULT_LOOP_TO_SECONDS) or 0)
+                    if args.force_transcode:
+                        info(f"  would force-transcode ({getattr(args, 'quality', DEFAULT_QUALITY)})")
+                    elif args.no_transcode or probe.get("ready"):
+                        info(f"  would skip transcode — {probe.get('reason')}")
+                    else:
+                        info(f"  would transcode — {probe.get('reason')}")
+                        if loop_to > 0:
+                            n = aerial_loop_count(probe.get("duration"), loop_to_seconds=loop_to)
+                            if n > 1:
+                                info(f"  would loop ×{n} to ~{loop_to}s")
+                    if save_transcoded:
+                        info(f"  would save {TRANSCODED_DIR_NAME}/{src.stem}.mov")
+                registered_assets[src.name] = {"id": asset_id, "title": title, "kind": "video"}
+                continue
+            if reuse:
+                info("  check: already registered — keeping existing encode")
+                reused_n += 1
+                if not thumb.exists():
+                    make_thumbnail(dest, thumb)
+            else:
+                did_encode = transcode_or_copy(
+                    src,
+                    dest,
+                    force_transcode=args.force_transcode,
+                    skip_transcode=args.no_transcode,
+                    quality=getattr(args, "quality", DEFAULT_QUALITY),
+                    loop_to_seconds=int(getattr(args, "loop_to", DEFAULT_LOOP_TO_SECONDS) or 0),
+                )
+                if did_encode:
+                    encoded_n += 1
+                make_thumbnail(dest, thumb)
             new_assets.append(
                 build_asset(
                     asset_id=asset_id,
@@ -1221,7 +1261,10 @@ def cmd_register(args: argparse.Namespace) -> None:
                 "source": str(src),
                 "aerial": str(dest),
             }
-            if save_transcoded:
+            prev_entry = prev_assets.get(src.name) or {}
+            if isinstance(prev_entry, dict) and prev_entry.get("local_transcode"):
+                entry["local_transcode"] = prev_entry["local_transcode"]
+            if save_transcoded and not reuse:
                 local = save_local_transcode_copy(src, dest, folder)
                 entry["local_transcode"] = str(local)
             registered_assets[src.name] = entry
@@ -1241,7 +1284,10 @@ def cmd_register(args: argparse.Namespace) -> None:
             entries["categories"] = [cat] + list(entries.get("categories") or [])
             save_entries(entries)
             did_videos = True
-            info(f"Registered {len(new_assets)} video(s) under category “{cat_name}”")
+            info(
+                f"Registered {len(new_assets)} video(s) under category “{cat_name}” "
+                f"({reused_n} kept, {encoded_n} encoded)"
+            )
 
     if images and not args.videos_only:
         if args.dry_run:
@@ -1955,7 +2001,7 @@ def build_parser() -> MacpaperParser:
     r.add_argument(
         "--force-transcode",
         action="store_true",
-        help="Always re-encode with temporal layers (needed to fix already-registered clips)",
+        help="Re-encode all clips (ignore cached aerials; fix older/broken encodes)",
     )
     r.add_argument(
         "--quality",
