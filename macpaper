@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
@@ -80,13 +80,16 @@ IMAGE_PLIST = (
     / "Data/Library/Preferences/com.apple.wallpaper.extension.image.plist"
 )
 
-COMMANDS = ("register", "unregister", "list", "refresh", "help", "version")
+COMMANDS = ("register", "unregister", "unregister-video", "list", "refresh", "help", "version")
 COMMAND_ALIASES: dict[str, str] = {
     "add": "register",
     "install": "register",
     "rm": "unregister",
     "remove": "unregister",
     "delete": "unregister",
+    "rm-video": "unregister-video",
+    "remove-video": "unregister-video",
+    "delete-video": "unregister-video",
     "ls": "list",
     "status": "list",
     "reload": "refresh",
@@ -461,6 +464,171 @@ def remove_category_assets(entries: dict[str, Any], category_id: str, subcategor
     return removed_ids
 
 
+def remove_single_asset(
+    entries: dict[str, Any],
+    *,
+    asset_id: str,
+    category_id: str,
+) -> bool:
+    """Remove one aerial asset. Updates/drops its category if it becomes empty."""
+    assets = list(entries.get("assets") or [])
+    kept = [a for a in assets if a.get("id") != asset_id]
+    if len(kept) == len(assets):
+        return False
+    entries["assets"] = kept
+
+    still = [a for a in kept if category_id in (a.get("categories") or [])]
+    new_cats: list[dict[str, Any]] = []
+    for cat in entries.get("categories") or []:
+        if cat.get("id") != category_id:
+            new_cats.append(cat)
+            continue
+        if not still:
+            continue  # remove empty macpaper category
+        rep = still[0]
+        updated = dict(cat)
+        updated["representativeAssetID"] = rep["id"]
+        updated["previewImage"] = rep.get("previewImage") or updated.get("previewImage")
+        subs = []
+        for sub in updated.get("subcategories") or []:
+            s = dict(sub)
+            s["representativeAssetID"] = rep["id"]
+            s["previewImage"] = rep.get("previewImage") or s.get("previewImage")
+            subs.append(s)
+        updated["subcategories"] = subs
+        new_cats.append(updated)
+    entries["categories"] = new_cats
+    return True
+
+
+def lookup_folder_state(
+    state: dict[str, Any], folder: Path
+) -> tuple[str, dict[str, Any] | None]:
+    key = normalize_path(folder)
+    prev = (state.get("folders") or {}).get(key)
+    if prev:
+        return key, prev
+    alt = key[len("/private") :] if key.startswith("/private/") else "/private" + key
+    prev = (state.get("folders") or {}).get(alt)
+    if prev:
+        return alt, prev
+    return key, None
+
+
+def match_tracked_asset(
+    assets: dict[str, Any], video_name: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Find a tracked asset by exact name/path, or a unique partial match."""
+    needle = video_name.strip()
+    if not needle:
+        return None
+    needle_expanded = str(Path(needle).expanduser())
+    needle_base = Path(needle_expanded).name
+    needle_stem = Path(needle_expanded).stem
+    needle_l = needle.lower()
+    needle_base_l = needle_base.lower()
+    needle_stem_l = needle_stem.lower()
+
+    def dedupe(pairs: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
+        seen: set[str] = set()
+        out: list[tuple[str, dict[str, Any]]] = []
+        for k, m in pairs:
+            aid = str(m.get("id") or k)
+            if aid in seen:
+                continue
+            seen.add(aid)
+            out.append((k, m))
+        return out
+
+    exact: list[tuple[str, dict[str, Any]]] = []
+    partial: list[tuple[str, dict[str, Any]]] = []
+
+    for key, meta in assets.items():
+        if not isinstance(meta, dict):
+            continue
+        src = str(meta.get("source") or "")
+        src_name = Path(src).name if src else key
+        src_stem = Path(src_name).stem
+        title = str(meta.get("title") or "")
+        key_l, src_l, stem_l, title_l = (
+            key.lower(),
+            src_name.lower(),
+            src_stem.lower(),
+            title.lower(),
+        )
+
+        if (
+            needle_expanded == src
+            or needle == key
+            or needle_base == key
+            or needle_base == src_name
+            or needle_stem == src_stem
+            or needle_base_l == key_l
+            or needle_base_l == src_l
+            or needle_stem_l == stem_l
+        ):
+            exact.append((key, meta))
+            continue
+
+        # Unique substring / prefix match against filename, stem, or title
+        haystacks = (key_l, src_l, stem_l, title_l)
+        if any(
+            needle_l in h or h.startswith(needle_l) or needle_stem_l in h
+            for h in haystacks
+            if h
+        ):
+            partial.append((key, meta))
+
+    exact_u = dedupe(exact)
+    if len(exact_u) == 1:
+        return exact_u[0]
+    if len(exact_u) > 1:
+        names = ", ".join(k for k, _ in exact_u)
+        die(
+            f"ambiguous video “{video_name}” matches: {names}",
+            hint="Pass a more specific filename.",
+        )
+
+    partial_u = dedupe(partial)
+    if len(partial_u) == 1:
+        return partial_u[0]
+    if len(partial_u) > 1:
+        names = ", ".join(k for k, _ in partial_u)
+        die(
+            f"ambiguous video “{video_name}” matches: {names}",
+            hint="Narrow the name so it matches only one source (e.g. full filename).",
+        )
+    return None
+
+
+def confirm_unregister(message: str, *, assume_yes: bool) -> bool:
+    """Ask before destructive unregister. Returns True if allowed to proceed."""
+    if assume_yes:
+        return True
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die(
+            "refusing to unregister without confirmation in non-interactive mode",
+            hint=f"Re-run with {S.cyan('--yes')} to confirm.",
+        )
+    info(message)
+    return _prompt_yes_no("Proceed?", default=False)
+
+
+def delete_asset_media(asset_id: str, local_transcode: str | None = None) -> list[str]:
+    """Delete aerial encode, thumbnail, and optional local transcoded copy."""
+    deleted: list[str] = []
+    for p in (VIDEOS_DIR / f"{asset_id}.mov", THUMBS_DIR / f"{asset_id}.png"):
+        if p.exists():
+            p.unlink()
+            deleted.append(str(p))
+    if local_transcode:
+        lp = Path(local_transcode)
+        if lp.exists() and TRANSCODED_DIR_NAME in lp.parts:
+            lp.unlink()
+            deleted.append(str(lp))
+    return deleted
+
+
 def build_asset(
     *,
     asset_id: str,
@@ -690,6 +858,7 @@ def cmd_register(args: argparse.Namespace) -> None:
                 "title": title,
                 "kind": "video",
                 "source": str(src),
+                "aerial": str(dest),
             }
             if save_transcoded:
                 local = save_local_transcode_copy(src, dest, folder)
@@ -753,32 +922,40 @@ def cmd_register(args: argparse.Namespace) -> None:
 
 def cmd_unregister(args: argparse.Namespace) -> None:
     folder = Path(normalize_path(args.folder))
-    key = normalize_path(folder)
     state = load_state()
-    prev = state.get("folders", {}).get(key)
-    # Also try non-/private key in case an older run stored /tmp/…
-    if not prev:
-        alt = key[len("/private") :] if key.startswith("/private/") else "/private" + key
-        prev = state.get("folders", {}).get(alt)
-        if prev:
-            key = alt
+    key, prev = lookup_folder_state(state, folder)
 
     if not prev and not args.force:
-        die(f"folder not tracked by macpaper: {folder}\n(use --force to scrub by path hash anyway)")
+        die(f"folder not tracked by macpaper: {folder}", hint="use --force to scrub by path hash anyway")
 
     category_id = (prev or {}).get("category_id") or deterministic_uuid(f"category:{normalize_path(folder)}")
     subcategory_id = (prev or {}).get("subcategory_id") or deterministic_uuid(
         f"subcategory:{normalize_path(folder)}"
     )
 
+    n_videos = len((prev or {}).get("assets") or {})
+    summary = (
+        f"Unregister entire folder {S.cyan(str(folder))}\n"
+        f"  This removes all {n_videos} tracked video(s) and any image-folder registration."
+    )
+    if not getattr(args, "dry_run", False):
+        if not confirm_unregister(summary, assume_yes=getattr(args, "yes", False)):
+            info(S.dim("Cancelled."))
+            return
+
     if ENTRIES.exists():
         entries = load_entries()
         removed = remove_category_assets(entries, category_id, subcategory_id)
         save_entries(entries)
         for aid in removed:
-            for p in (VIDEOS_DIR / f"{aid}.mov", THUMBS_DIR / f"{aid}.png"):
-                if p.exists():
-                    p.unlink()
+            # Also drop local transcoded copies recorded in state
+            local = None
+            if prev:
+                for meta in (prev.get("assets") or {}).values():
+                    if isinstance(meta, dict) and meta.get("id") == aid:
+                        local = meta.get("local_transcode")
+                        break
+            delete_asset_media(aid, str(local) if local else None)
         info(f"Removed {len(removed)} aerial asset(s)")
 
     if unregister_image_folder(folder):
@@ -792,7 +969,88 @@ def cmd_unregister(args: argparse.Namespace) -> None:
 
     if not args.no_restart:
         restart_wallpaper_services()
-    ok("Unregistered.")
+    ok("Unregistered folder.")
+
+
+def cmd_unregister_video(args: argparse.Namespace) -> None:
+    """Remove a single source video's aerial listing and encodes only."""
+    folder = Path(normalize_path(args.folder))
+    video_name = args.video
+    state = load_state()
+    key, prev = lookup_folder_state(state, folder)
+
+    if not prev:
+        die(
+            f"folder not tracked by macpaper: {folder}",
+            hint=f"Register it first, or check {S.cyan('macpaper list')}.",
+        )
+
+    assets = dict(prev.get("assets") or {})
+    if not assets:
+        die("no videos tracked for this folder", hint="Nothing to remove.")
+
+    matched = match_tracked_asset(assets, video_name)
+    if not matched:
+        known = ", ".join(sorted(assets.keys())) or "(none)"
+        die(
+            f"video “{video_name}” not found in macpaper state for this folder",
+            hint=f"Tracked sources: {known}",
+        )
+
+    asset_key, meta = matched
+    asset_id = meta.get("id")
+    if not asset_id:
+        die(f"tracked entry for “{asset_key}” has no asset id")
+
+    category_id = prev.get("category_id") or deterministic_uuid(f"category:{key}")
+    local_tc = meta.get("local_transcode")
+    if not local_tc:
+        candidate = folder / TRANSCODED_DIR_NAME / f"{Path(asset_key).stem}.mov"
+        if candidate.exists():
+            local_tc = str(candidate)
+
+    if args.dry_run:
+        info(f"Would remove aerial for {asset_key} ({asset_id})")
+        if local_tc:
+            info(f"Would delete local copy {local_tc}")
+        return
+
+    summary = f"Unregister video {S.cyan(asset_key)}"
+    if video_name != asset_key:
+        summary += f"  {S.dim(f'(matched from “{video_name}”)')}"
+    summary += f"\n  aerial id: {S.dim(str(asset_id))}"
+    if local_tc:
+        summary += f"\n  local copy: {S.dim(str(local_tc))}"
+    summary += "\n  Other videos in this folder will be left alone."
+    if not confirm_unregister(summary, assume_yes=getattr(args, "yes", False)):
+        info(S.dim("Cancelled."))
+        return
+
+    if ENTRIES.exists():
+        entries = load_entries()
+        if remove_single_asset(entries, asset_id=asset_id, category_id=category_id):
+            save_entries(entries)
+            info(f"Removed aerial listing for {asset_key}")
+        else:
+            warn(f"Asset {asset_id} was not present in entries.json (cleaning files/state anyway)")
+
+    deleted = delete_asset_media(str(asset_id), str(local_tc) if local_tc else None)
+    for path in deleted:
+        info(f"Deleted {path}")
+
+    del assets[asset_key]
+    prev["assets"] = assets
+    prev["updated_at"] = datetime.now(timezone.utc).isoformat()
+    state.setdefault("folders", {})[key] = prev
+    # If no videos left and no image registration, drop folder state entirely
+    if not assets and not prev.get("image_folder_registered"):
+        del state["folders"][key]
+        info("No media left for this folder — cleared macpaper state entry")
+    save_state(state)
+
+    if not args.no_restart:
+        restart_wallpaper_services()
+    ok(f"Unregistered video “{asset_key}”. Other videos untouched.")
 
 
 def is_macpaper_asset(asset: dict[str, Any], owned_ids: set[str] | None = None) -> bool:
@@ -834,6 +1092,8 @@ def cmd_list(_: argparse.Namespace) -> None:
             info(f"  {S.cyan(path)}")
             info(f"    category: {meta.get('name')} ({S.dim(str(meta.get('category_id')))})")
             info(f"    videos:   {len(assets)}")
+            for name in sorted(assets.keys()):
+                info(f"      • {name}")
             info(f"    images:   {'yes' if meta.get('image_folder_registered') else 'no'}")
 
     # Image folders macpaper registered (intersection with state when possible)
@@ -911,6 +1171,7 @@ def print_banner_help() -> None:
     rows = [
         ("register", "add", "Register a folder of videos/images"),
         ("unregister", "rm", "Remove a previously registered folder"),
+        ("unregister-video", "rm-video", "Remove one source video from Settings"),
         ("list", "ls", "Show what macpaper has registered"),
         ("refresh", "reload", "Restart WallpaperAgent so Settings reloads"),
         ("help", "-h", "Show this help"),
@@ -924,6 +1185,7 @@ def print_banner_help() -> None:
     print(f"    {S.dim('$')} macpaper register ~/Clips --videos-only")
     print(f"    {S.dim('$')} macpaper list")
     print(f"    {S.dim('$')} macpaper unregister ~/Movies/Wallpapers")
+    print(f"    {S.dim('$')} macpaper unregister-video ~/Movies/Wallpapers clip.mp4")
     print()
     print(f"  {S.bold('Tips')}")
     print(f"    Run {S.cyan('macpaper <command> --help')} for command-specific flags.")
@@ -961,20 +1223,23 @@ def interactive_menu() -> list[str]:
     print(f"  {S.bold('What would you like to do?')}")
     print(f"    {S.cyan('1')}  Register a folder")
     print(f"    {S.cyan('2')}  Unregister a folder")
-    print(f"    {S.cyan('3')}  List registered media")
-    print(f"    {S.cyan('4')}  Refresh WallpaperAgent")
-    print(f"    {S.cyan('5')}  Quit")
+    print(f"    {S.cyan('3')}  Unregister one video")
+    print(f"    {S.cyan('4')}  List registered media")
+    print(f"    {S.cyan('5')}  Refresh WallpaperAgent")
+    print(f"    {S.cyan('6')}  Quit")
     print()
 
-    choice = _prompt("Choose 1–5", "1")
+    choice = _prompt("Choose 1–6", "1")
     mapping = {
         "1": "register",
         "2": "unregister",
-        "3": "list",
-        "4": "refresh",
-        "5": "quit",
+        "3": "unregister-video",
+        "4": "list",
+        "5": "refresh",
+        "6": "quit",
         "register": "register",
         "unregister": "unregister",
+        "unregister-video": "unregister-video",
         "list": "list",
         "refresh": "refresh",
         "quit": "quit",
@@ -983,17 +1248,22 @@ def interactive_menu() -> list[str]:
     cmd = mapping.get(choice.lower())
     if cmd is None:
         hint = suggest_command(choice)
-        die(f"unknown choice “{choice}”", hint=hint or "Enter a number from 1–5.")
+        die(f"unknown choice “{choice}”", hint=hint or "Enter a number from 1–6.")
     if cmd == "quit":
         print(f"  {S.dim('Bye.')}")
         raise SystemExit(0)
 
     argv = [cmd]
-    if cmd in {"register", "unregister"}:
+    if cmd in {"register", "unregister", "unregister-video"}:
         folder = _prompt("Folder path")
         if not folder:
             die("a folder path is required", hint="Example: ~/Movies/Wallpapers")
         argv.append(folder)
+        if cmd == "unregister-video":
+            video = _prompt("Source video name (e.g. clip.mp4)")
+            if not video:
+                die("a video name is required", hint="Use the original filename from the folder.")
+            argv.append(video)
         if cmd == "register":
             name = _prompt("Category name (optional, Enter to skip)", "")
             if name:
@@ -1138,7 +1408,21 @@ def build_parser() -> MacpaperParser:
     )
     u.add_argument("folder", help="Folder previously passed to register")
     u.add_argument("--force", action="store_true", help="Scrub even if not in macpaper state")
+    u.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     u.add_argument("--no-restart", action="store_true", help="Do not restart WallpaperAgent")
+
+    uv = add_cmd(
+        "unregister-video",
+        "Remove one source video from Wallpaper / Screen Saver",
+        cmd_unregister_video,
+        aliases=("rm-video", "remove-video", "delete-video"),
+    )
+    uv.add_argument("folder", help="Folder previously passed to register")
+    uv.add_argument("video", help="Source video name (exact or unique partial match)")
+    uv.add_argument("--dry-run", action="store_true", help="Show what would be removed")
+    uv.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    uv.add_argument("--no-restart", action="store_true", help="Do not restart WallpaperAgent")
+    uv.epilog = "Example:\n  macpaper unregister-video ~/Movies/Wallpapers sunset"
 
     add_cmd("list", "List registered folders / custom aerials", cmd_list, aliases=("ls", "status"))
     add_cmd("refresh", "Restart WallpaperAgent so Settings reloads", cmd_refresh, aliases=("reload", "restart"))
@@ -1170,6 +1454,7 @@ def main(argv: list[str] | None = None) -> None:
     known = {
         "register",
         "unregister",
+        "unregister-video",
         "list",
         "refresh",
         "help",
@@ -1179,6 +1464,9 @@ def main(argv: list[str] | None = None) -> None:
         "rm",
         "remove",
         "delete",
+        "rm-video",
+        "remove-video",
+        "delete-video",
         "ls",
         "status",
         "reload",

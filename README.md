@@ -94,9 +94,24 @@ Mistyped commands get “Did you mean …?” hints. Aliases: `add` / `rm` / `ls
 
 ### `unregister <folder>`
 
+Remove an entire previously registered folder (all videos + image-folder entry). Asks for confirmation unless `--yes`.
+
 ```bash
 ./macpaper unregister ~/Movies/MyWallpapers
-./macpaper unregister ~/Movies/MyWallpapers --force
+./macpaper unregister ~/Movies/MyWallpapers --yes
+./macpaper unregister ~/Movies/MyWallpapers --force --yes
+```
+
+### `unregister-video <folder> <video>`
+
+Remove **one** source video from Wallpaper / Screen Saver. The name may be a unique partial match (e.g. `sun` → `sunset.mp4`). Asks for confirmation unless `--yes`.
+
+Deletes only that aerial listing, its system encode/thumbnail, and its local `transcoded/` copy if present. Other videos stay.
+
+```bash
+./macpaper unregister-video ~/Movies/MyWallpapers sunset.mp4
+./macpaper rm-video ~/Movies/MyWallpapers sun          # unique partial match
+./macpaper unregister-video ~/Movies/MyWallpapers sun --yes
 ```
 
 ### `list`
