@@ -15,6 +15,14 @@ Uses only Apple system paths and its own data directory. No other wallpaper apps
 
 ### Homebrew
 
+One-shot (tap + trust + install):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/anantdark/macpaper/main/scripts/install.sh | bash
+```
+
+Or step by step:
+
 ```bash
 brew tap anantdark/macpaper
 brew trust anantdark/macpaper   # Homebrew 6+ third-party tap trust
