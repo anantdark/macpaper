@@ -78,6 +78,8 @@ Mistyped commands get “Did you mean …?” hints. Aliases: `add` / `rm` / `ls
 | `--images-only` | Only register the folder for still images |
 | `--no-transcode` | Copy/link as-is instead of encoding to HEVC |
 | `--force-transcode` | Always re-encode to HEVC `.mov` |
+| `--save-transcoded` | Also copy encodes into `<folder>/transcoded/` |
+| `--no-save-transcoded` | Skip the save prompt; don’t write local copies |
 | `--no-restart` | Don’t restart WallpaperAgent (batch, then `refresh`) |
 | `--dry-run` | Preview without writing |
 
@@ -120,6 +122,8 @@ Restarts `WallpaperAgent` / `cfprefsd` so System Settings reloads.
 **macpaper-only state:** `~/Library/Application Support/macpaper/`  
 Manifest backups: `entries.json.macpaper-bak-*`  
 Asset tags use shot IDs prefixed with `MACAPER_` so unregister never touches other apps’ entries.
+
+Optional: with `--save-transcoded` (or answering yes to the prompt), HEVC copies are also written to `<folder>/transcoded/`. That folder is ignored on later scans.
 
 ## Tips
 

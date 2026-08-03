@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
@@ -58,6 +58,9 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif"
 # Only entries under this namespace / shot prefix are created or removed by macpaper.
 CAT_NAMESPACE = uuid.UUID("CE000000-0000-4000-8000-000000000000")
 SHOT_PREFIX = "macpaper".upper()  # "MACAPER"
+# Folder name used for optional local copies of HEVC encodes; never scanned as input.
+TRANSCODED_DIR_NAME = "transcoded"
+SKIP_DIR_NAMES = frozenset({TRANSCODED_DIR_NAME})
 
 HOME = Path.home()
 AERIALS = HOME / "Library/Application Support/com.apple.wallpaper/aerials"
@@ -217,11 +220,24 @@ def deterministic_uuid(name: str) -> str:
     return str(uuid.uuid5(CAT_NAMESPACE, name)).upper()
 
 
+def is_under_skipped_dir(path: Path) -> bool:
+    """True if any path component is a reserved dir (e.g. transcoded/)."""
+    return any(part.lower() in SKIP_DIR_NAMES for part in path.parts)
+
+
 def scan_folder(folder: Path) -> tuple[list[Path], list[Path]]:
+    """List media in folder. Skips reserved dirs like transcoded/."""
     videos: list[Path] = []
     images: list[Path] = []
     for p in sorted(folder.iterdir()):
-        if not p.is_file() or p.name.startswith("."):
+        if p.name.startswith("."):
+            continue
+        if p.is_dir():
+            # Never descend into reserved output folders
+            if p.name.lower() in SKIP_DIR_NAMES:
+                continue
+            continue  # top-level files only (dirs other than skipped are ignored)
+        if not p.is_file() or is_under_skipped_dir(p):
             continue
         ext = p.suffix.lower()
         if ext in VIDEO_EXTS:
@@ -229,6 +245,37 @@ def scan_folder(folder: Path) -> tuple[list[Path], list[Path]]:
         elif ext in IMAGE_EXTS:
             images.append(p)
     return videos, images
+
+
+def resolve_save_transcoded(args: argparse.Namespace) -> bool:
+    """Whether to keep a local copy under <folder>/transcoded/."""
+    if getattr(args, "save_transcoded", False):
+        return True
+    if getattr(args, "no_save_transcoded", False):
+        return False
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return _prompt_yes_no(
+            f"Also save transcoded videos into ./{TRANSCODED_DIR_NAME}/?",
+            default=False,
+        )
+    return False
+
+
+def save_local_transcode_copy(src: Path, encoded: Path, folder: Path) -> Path:
+    """Copy the aerials encode into <folder>/transcoded/<stem>.mov."""
+    out_dir = folder / TRANSCODED_DIR_NAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / f"{src.stem}.mov"
+    if dest.resolve() == encoded.resolve():
+        return dest
+    if dest.exists():
+        dest.unlink()
+    try:
+        os.link(encoded, dest)
+    except OSError:
+        shutil.copy2(encoded, dest)
+    info(f"  saved   {dest.relative_to(folder)}")
+    return dest
 
 
 def ensure_aerials_ready() -> None:
@@ -297,7 +344,8 @@ def needs_transcode(path: Path) -> bool:
         return True
 
 
-def transcode_or_copy(src: Path, dest: Path, *, force_transcode: bool, skip_transcode: bool) -> None:
+def transcode_or_copy(src: Path, dest: Path, *, force_transcode: bool, skip_transcode: bool) -> bool:
+    """Write dest from src. Returns True if ffmpeg transcode ran."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
@@ -308,11 +356,11 @@ def transcode_or_copy(src: Path, dest: Path, *, force_transcode: bool, skip_tran
         try:
             os.link(src, dest)
             info(f"  linked  {src.name} → {dest.name}")
-            return
+            return False
         except OSError:
             shutil.copy2(src, dest)
             info(f"  copied  {src.name} → {dest.name}")
-            return
+            return False
 
     info(f"  transcoding {src.name} → HEVC .mov …")
     cmd = [
@@ -360,6 +408,7 @@ def transcode_or_copy(src: Path, dest: Path, *, force_transcode: bool, skip_tran
         r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if r.returncode != 0 or not dest.exists():
             die(f"ffmpeg failed for {src.name}:\n{r.stderr[-2000:]}")
+    return True
 
 
 def make_thumbnail(video: Path, thumb: Path) -> None:
@@ -592,6 +641,9 @@ def cmd_register(args: argparse.Namespace) -> None:
     if videos and not args.images_only:
         ensure_aerials_ready()
         entries = load_entries()
+        save_transcoded = resolve_save_transcoded(args)
+        if save_transcoded:
+            info(f"Local copies will be saved under {folder / TRANSCODED_DIR_NAME}/")
 
         # Drop previous registration for this folder
         prev = state.get("folders", {}).get(key, {})
@@ -612,6 +664,8 @@ def cmd_register(args: argparse.Namespace) -> None:
             info(f"[{i + 1}/{len(videos)}] {src.name}")
             if args.dry_run:
                 registered_assets[src.name] = {"id": asset_id, "title": title, "kind": "video"}
+                if save_transcoded:
+                    info(f"  would save {TRANSCODED_DIR_NAME}/{src.stem}.mov")
                 continue
             transcode_or_copy(
                 src,
@@ -631,12 +685,16 @@ def cmd_register(args: argparse.Namespace) -> None:
                     order=i,
                 )
             )
-            registered_assets[src.name] = {
+            entry: dict[str, Any] = {
                 "id": asset_id,
                 "title": title,
                 "kind": "video",
                 "source": str(src),
             }
+            if save_transcoded:
+                local = save_local_transcode_copy(src, dest, folder)
+                entry["local_transcode"] = str(local)
+            registered_assets[src.name] = entry
 
         if not args.dry_run and new_assets:
             preview = new_assets[0]["previewImage"]
@@ -944,6 +1002,10 @@ def interactive_menu() -> list[str]:
                 argv.append("--videos-only")
             elif _prompt_yes_no("Images only?", False):
                 argv.append("--images-only")
+            if _prompt_yes_no(f"Also save transcoded videos into ./{TRANSCODED_DIR_NAME}/?", False):
+                argv.append("--save-transcoded")
+            else:
+                argv.append("--no-save-transcoded")
             if _prompt_yes_no("Dry run (preview only)?", False):
                 argv.append("--dry-run")
         print()
@@ -1053,6 +1115,17 @@ def build_parser() -> MacpaperParser:
     r.add_argument("--images-only", action="store_true", help="Only register the folder for still images")
     r.add_argument("--no-transcode", action="store_true", help="Copy/link as-is (skip HEVC encode)")
     r.add_argument("--force-transcode", action="store_true", help="Always re-encode to HEVC")
+    save_group = r.add_mutually_exclusive_group()
+    save_group.add_argument(
+        "--save-transcoded",
+        action="store_true",
+        help=f"Also copy encodes into <folder>/{TRANSCODED_DIR_NAME}/",
+    )
+    save_group.add_argument(
+        "--no-save-transcoded",
+        action="store_true",
+        help=f"Do not write copies under <folder>/{TRANSCODED_DIR_NAME}/ (skip prompt)",
+    )
     r.add_argument("--no-restart", action="store_true", help="Do not restart WallpaperAgent")
     r.add_argument("--dry-run", action="store_true", help="Show what would be done")
     r.epilog = "Example:\n  macpaper register ~/Movies/Wallpapers --name \"My Wallpapers\""
