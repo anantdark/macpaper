@@ -101,7 +101,7 @@ First run may take a few minutes per video while macpaper encodes them the way m
 | `--save-transcoded` | Also keep copies under `<folder>/transcoded/` |
 | `--dry-run` | Preview only |
 
-Re-running `register` on the same folder **keeps** already-encoded aerials and only encodes new or changed files (source newer than cache). Use `--force-transcode` to redo everything.
+Re-running `register` on the same folder **keeps** already-encoded aerials and only encodes new or changed files (source newer than cache). After unregister, ready files under `<folder>/transcoded/` are reused on the next register. Use `--force-transcode` to redo everything.
 
 **Videos:** `.mp4` `.mov` `.m4v` `.mkv` `.avi` `.webm` `.mts` `.m2ts`  
 **Images:** `.jpg` `.jpeg` `.png` `.heic` `.heif` `.tif` `.tiff` `.gif` `.webp` `.bmp`
@@ -140,8 +140,9 @@ Videos are encoded with **HEVC temporal layers** (required for the native freeze
 - Calm clips feel best as screensavers; freeze-as-wallpaper does not need long loops
 - Encode is once-through by default (no pad-to-300s). Use `--loop-to 300` only if you want Apple-length clips
 - Re-run `register` after you add files — already-registered clips are kept; only new/changed ones encode
+- Keep `transcoded/` copies (answer yes / `--save-transcoded`) so unregister → register can skip re-encode
 - If Settings was open during register, quit it or run `macpaper refresh`
-- Re-fix old registrations with `macpaper register <folder> --force-transcode`
+- Re-encode everything with `macpaper register <folder> --force-transcode`
 
 ## Uninstall
 

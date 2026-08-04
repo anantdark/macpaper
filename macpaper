@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-__version__ = "1.4.5"
+__version__ = "1.4.6"
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".webp", ".bmp"}
@@ -597,11 +597,16 @@ def encode_temporal_hevc(
         )
 
 
+def local_transcode_path(folder: Path, src: Path) -> Path:
+    """Path of optional local HEVC copy: <folder>/transcoded/<stem>.mov."""
+    return folder / TRANSCODED_DIR_NAME / f"{src.stem}.mov"
+
+
 def aerial_cache_reusable(dest: Path, src: Path, *, force: bool) -> bool:
     """True if dest is already a temporal aerial for this source — skip re-encode.
 
-    Reuses the cached file under aerials/videos/ when present, temporal-ready,
-    and not older than the source. --force-transcode disables reuse.
+    Reuses a file when present, temporal-ready, and not older than the source.
+    --force-transcode disables reuse.
     """
     if force:
         return False
@@ -613,6 +618,21 @@ def aerial_cache_reusable(dest: Path, src: Path, *, force: bool) -> bool:
     except OSError:
         return False
     return has_temporal_layers(dest)
+
+
+def install_encoded_to_aerial(encoded: Path, dest: Path) -> None:
+    """Hardlink or copy an existing temporal encode into the aerials videos dir."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    try:
+        if encoded.resolve() == dest.resolve():
+            return
+        os.link(encoded, dest)
+        info(f"  linked  {encoded.name} → {dest.name}")
+    except OSError:
+        shutil.copy2(encoded, dest)
+        info(f"  copied  {encoded.name} → {dest.name}")
 
 
 def transcode_or_copy(
@@ -980,17 +1000,19 @@ def confirm_unregister(message: str, *, assume_yes: bool) -> bool:
 
 
 def delete_asset_media(asset_id: str, local_transcode: str | None = None) -> list[str]:
-    """Delete aerial encode, thumbnail, and optional local transcoded copy."""
+    """Delete aerial encode and thumbnail.
+
+    Local copies under <folder>/transcoded/ are kept so a later register can
+    reuse them without re-encoding. Pass local_transcode only to record the
+    path in logs; it is not deleted.
+    """
     deleted: list[str] = []
     for p in (VIDEOS_DIR / f"{asset_id}.mov", THUMBS_DIR / f"{asset_id}.png"):
         if p.exists():
             p.unlink()
             deleted.append(str(p))
-    if local_transcode:
-        lp = Path(local_transcode)
-        if lp.exists() and TRANSCODED_DIR_NAME in lp.parts:
-            lp.unlink()
-            deleted.append(str(lp))
+    # Intentionally do not delete local_transcode — kept for re-register reuse.
+    _ = local_transcode
     return deleted
 
 
@@ -1206,9 +1228,15 @@ def cmd_register(args: argparse.Namespace) -> None:
             reuse = aerial_cache_reusable(
                 dest, src, force=bool(args.force_transcode)
             )
+            local_tc = local_transcode_path(folder, src)
+            reuse_local = (not reuse) and aerial_cache_reusable(
+                local_tc, src, force=bool(args.force_transcode)
+            )
             if args.dry_run:
                 if reuse:
                     info("  would keep existing aerial encode")
+                elif reuse_local:
+                    info(f"  would reuse {TRANSCODED_DIR_NAME}/{local_tc.name}")
                 else:
                     probe = probe_video(src)
                     loop_to = int(getattr(args, "loop_to", DEFAULT_LOOP_TO_SECONDS) or 0)
@@ -1231,6 +1259,14 @@ def cmd_register(args: argparse.Namespace) -> None:
                 reused_n += 1
                 if not thumb.exists():
                     make_thumbnail(dest, thumb)
+            elif reuse_local:
+                info(
+                    f"  check: {S.green('reusing')} {TRANSCODED_DIR_NAME}/{local_tc.name} "
+                    f"— skip encode"
+                )
+                install_encoded_to_aerial(local_tc, dest)
+                reused_n += 1
+                make_thumbnail(dest, thumb)
             else:
                 did_encode = transcode_or_copy(
                     src,
@@ -1264,7 +1300,9 @@ def cmd_register(args: argparse.Namespace) -> None:
             prev_entry = prev_assets.get(src.name) or {}
             if isinstance(prev_entry, dict) and prev_entry.get("local_transcode"):
                 entry["local_transcode"] = prev_entry["local_transcode"]
-            if save_transcoded and not reuse:
+            if reuse_local or local_tc.exists():
+                entry["local_transcode"] = str(local_tc)
+            if save_transcoded and not reuse and not reuse_local:
                 local = save_local_transcode_copy(src, dest, folder)
                 entry["local_transcode"] = str(local)
             registered_assets[src.name] = entry
@@ -1539,7 +1577,7 @@ def cmd_unregister_video(args: argparse.Namespace) -> None:
     if args.dry_run:
         info(f"Would remove aerial for {asset_key} ({asset_id})")
         if local_tc:
-            info(f"Would delete local copy {local_tc}")
+            info(f"Local copy kept for reuse: {local_tc}")
         return
 
     summary = f"Unregister video {S.cyan(asset_key)}"
@@ -1548,7 +1586,7 @@ def cmd_unregister_video(args: argparse.Namespace) -> None:
     summary += f"\n  aerial id: {S.dim(str(asset_id))}"
     summary += f"\n  folder: {S.dim(key)}"
     if local_tc:
-        summary += f"\n  local copy: {S.dim(str(local_tc))}"
+        summary += f"\n  local copy kept: {S.dim(str(local_tc))}"
     summary += "\n  Other videos in this folder will be left alone."
     if not confirm_unregister(summary, assume_yes=getattr(args, "yes", False)):
         info(S.dim("Cancelled."))
