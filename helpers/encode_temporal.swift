@@ -150,35 +150,32 @@ func makeReader() -> AVAssetReaderTrackOutput {
 }
 
 let frameTimescale: Int32 = 60000
-let outFrameDur = CMTimeMake(value: Int64(frameTimescale / Int32(outFps.rounded())), timescale: frameTimescale)
+let outFpsInt = max(1, Int(outFps.rounded()))
+let outFrameDur = CMTimeMake(value: Int64(frameTimescale / Int32(outFpsInt)), timescale: frameTimescale)
 
+// Strictly monotonic CFR timestamps. Deriving held PTS from source seconds
+// (CMTimeMakeWithSeconds) can collide on 23.976→240 and trip AVAssetWriter -16364.
+var outFrameIndex: Int64 = 0
 var n = 0
 for loop in 0..<loopCount {
-    let offset = CMTimeMultiply(clipDur, multiplier: Int32(loop))
     let rout = makeReader()
     while let sbuf = rout.copyNextSampleBuffer() {
+        if sw.failed { break }
         guard let pb = CMSampleBufferGetImageBuffer(sbuf) else { continue }
-        let srcPts = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(sbuf), offset)
-        // Stretch source timeline into outFps slots via frame holds.
-        let basePts: CMTime
-        if hold == 1 {
-            basePts = srcPts
-        } else {
-            let srcSec = CMTimeGetSeconds(srcPts)
-            basePts = CMTimeMakeWithSeconds(srcSec, preferredTimescale: frameTimescale)
-        }
-        for h in 0..<hold {
-            let pts = (hold == 1)
-                ? basePts
-                : CMTimeAdd(basePts, CMTimeMultiply(outFrameDur, multiplier: Int32(h)))
-            var dur = (hold == 1) ? CMSampleBufferGetDuration(sbuf) : outFrameDur
-            if !dur.isValid || dur.value == 0 { dur = outFrameDur }
+        for _ in 0..<hold {
+            if sw.failed { break }
+            let pts = CMTimeMake(
+                value: outFrameIndex * outFrameDur.value,
+                timescale: frameTimescale
+            )
+            outFrameIndex += 1
             VTCompressionSessionEncodeFrame(
-                session, imageBuffer: pb, presentationTimeStamp: pts, duration: dur,
+                session, imageBuffer: pb, presentationTimeStamp: pts, duration: outFrameDur,
                 frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
             n += 1
         }
     }
+    if sw.failed { break }
     if (loop % 10) == 0 {
         FileHandle.standardError.write(
             "  loop \(loop)/\(loopCount) fed \(n) frames\n".data(using: .utf8)!)
@@ -186,4 +183,8 @@ for loop in 0..<loopCount {
 }
 VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
 FileHandle.standardError.write("fed \(n) frames total\n".data(using: .utf8)!)
+if sw.failed {
+    FileHandle.standardError.write("encode aborted after writer failure\n".data(using: .utf8)!)
+    exit(1)
+}
 sw.finish()
