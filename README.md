@@ -103,6 +103,14 @@ First run may take a few minutes per video while macpaper encodes them the way m
 
 Re-running `register` on the same folder **keeps** already-encoded aerials and only encodes new or changed files (source newer than cache). After unregister, ready files under `<folder>/transcoded/` are reused on the next register. Use `--force-transcode` to redo everything.
 
+### Encoding & caching
+
+- Encodes use **VideoToolbox temporal HEVC** (hardware on Apple silicon) at ~240 fps frame-hold when the source is slower
+- Duration is **not** padded to ~300s by default; use `--loop-to 300` only if you want Apple-length files (slow)
+- Interrupted batches: run `register` again — finished clips stay skipped
+- Prefer `--save-transcoded` (or answer **y**) so unregister → register can reuse local `.mov` copies without encoding again
+- Preview with `--dry-run` to see keep / reuse / encode per file
+
 **Videos:** `.mp4` `.mov` `.m4v` `.mkv` `.avi` `.webm` `.mts` `.m2ts`  
 **Images:** `.jpg` `.jpeg` `.png` `.heic` `.heif` `.tif` `.tiff` `.gif` `.webp` `.bmp`
 
@@ -141,8 +149,10 @@ Videos are encoded with **HEVC temporal layers** (required for the native freeze
 - Encode is once-through by default (no pad-to-300s). Use `--loop-to 300` only if you want Apple-length clips
 - Re-run `register` after you add files — already-registered clips are kept; only new/changed ones encode
 - Keep `transcoded/` copies (answer yes / `--save-transcoded`) so unregister → register can skip re-encode
+- Unregister does **not** delete `transcoded/`; only Settings + aerial-cache copies go away
 - If Settings was open during register, quit it or run `macpaper refresh`
 - Re-encode everything with `macpaper register <folder> --force-transcode`
+- Stopped mid-batch? Re-run `register` — completed encodes resume as kept
 
 ## Uninstall
 
