@@ -31,6 +31,8 @@
       <a href="#install">Install</a>
       <a href="#first">First screensaver</a>
       <a href="#everyday">Everyday commands</a>
+      <a href="#encoding">Encoding &amp; caching</a>
+      <a href="#options">Register options</a>
       <a href="#check">Check &amp; re-encode</a>
       <a href="#remove">Remove clips</a>
       <a href="#troubleshoot">Troubleshooting</a>
@@ -93,7 +95,7 @@ brew trust anantdark/macpaper
 brew install macpaper
 macpaper version</code></pre>
         </div>
-        <p>You should see something like <code>macpaper 1.4.2</code>.</p>
+        <p>You should see something like <code>macpaper 1.4.6</code> (or newer).</p>
       </section>
 
       <section id="first">
@@ -110,7 +112,8 @@ macpaper version</code></pre>
           <pre><code>macpaper register ~/Movies/MyClips --name "My Clips"</code></pre>
         </div>
         <ol start="3">
-          <li>Wait while clips encode (first time can take a few minutes each).</li>
+          <li>When asked to save copies under <code>./transcoded/</code>, answer <strong>y</strong> if you want unregister → register later without re-encoding.</li>
+          <li>Wait while new clips encode (a few minutes each on first run; already-ready files are skipped).</li>
           <li>Quit <strong>System Settings</strong> if it was open, then reopen it.</li>
           <li>Go to <strong>Screen Saver</strong> → find <strong>My Clips</strong> → choose a video.</li>
         </ol>
@@ -132,6 +135,47 @@ macpaper version</code></pre>
             <tr><td>Remove one video by id</td><td><code>macpaper unregister B5F705B9-…</code></td></tr>
             <tr><td>Remove whole folder</td><td><code>macpaper unregister ~/Movies/MyClips</code></td></tr>
             <tr><td>Reload Settings</td><td><code>macpaper refresh</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="encoding">
+        <h2>Encoding &amp; caching</h2>
+        <p>
+          Clips are encoded to <strong>HEVC with temporal layers</strong> (VideoToolbox on Apple silicon)
+          so stop-screensaver → freeze-as-wallpaper works. Encode is once-through by default —
+          short clips are <em>not</em> padded to ~5 minutes unless you ask.
+        </p>
+        <ul>
+          <li><strong>Re-run register</strong> — keeps finished aerial encodes; only new or changed sources encode.</li>
+          <li><strong>Interrupted batch</strong> — run register again; completed clips are kept, the rest continue.</li>
+          <li><strong><code>transcoded/</code></strong> — optional local <code>.mov</code> copies. Unregister removes Settings entries but <em>keeps</em> these files; the next register reuses them.</li>
+          <li><strong><code>--force-transcode</code></strong> — ignore caches and encode everything again.</li>
+        </ul>
+        <div class="terminal" data-copy>
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <button type="button" class="copy-btn">Copy</button>
+          </div>
+          <pre><code>macpaper register ~/Movies/MyClips --save-transcoded</code></pre>
+        </div>
+      </section>
+
+      <section id="options">
+        <h2>Register options</h2>
+        <table>
+          <thead>
+            <tr><th>Option</th><th>Meaning</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>--name NAME</code></td><td>Name in Settings (default: folder name)</td></tr>
+            <tr><td><code>--videos-only</code> / <code>--images-only</code></td><td>Limit to live clips or stills</td></tr>
+            <tr><td><code>--save-transcoded</code></td><td>Keep copies under <code>&lt;folder&gt;/transcoded/</code> as <code>.mov</code></td></tr>
+            <tr><td><code>--quality {standard,high,max}</code></td><td>Bitrate preset (default: <code>high</code>)</td></tr>
+            <tr><td><code>--loop-to SECONDS</code></td><td>Pad short clips during encode (default <code>0</code> / off; <code>300</code> ≈ Apple length — slow)</td></tr>
+            <tr><td><code>--force-transcode</code></td><td>Re-encode even when a cache exists</td></tr>
+            <tr><td><code>--no-transcode</code></td><td>Skip encode (freeze often won’t work)</td></tr>
+            <tr><td><code>--dry-run</code></td><td>Preview keep / reuse / encode without writing</td></tr>
           </tbody>
         </table>
       </section>
@@ -165,7 +209,8 @@ macpaper version</code></pre>
         <h2>Remove clips safely</h2>
         <p>
           <code>unregister</code> never deletes your original files in Movies / Downloads.
-          It only removes Settings listings and the copies macpaper placed in Apple’s aerials folder.
+          It removes Settings listings and aerial-cache copies under Apple’s folder.
+          Files in <code>&lt;folder&gt;/transcoded/</code> are <strong>kept</strong> so a later register can reuse them.
         </p>
         <div class="terminal" data-copy>
           <div class="terminal-bar">
@@ -185,10 +230,14 @@ macpaper unregister ~/Movies/MyClips --yes</code></pre>
           <dd>Quit System Settings completely, run <code>macpaper refresh</code>, reopen Settings. Confirm with <code>macpaper list</code>.</dd>
           <dt>Screensaver works but unlock goes black / no freeze</dt>
           <dd>Re-encode with temporal layers: <code>macpaper register ~/Movies/MyClips --force-transcode</code>.</dd>
+          <dt>Register is re-encoding a clip I thought was done</dt>
+          <dd>Reuse needs either a good aerial cache or a ready file in <code>transcoded/</code>. Clips never saved there must encode once. Preview with <code>--dry-run</code>.</dd>
+          <dt>I stopped midway through a batch</dt>
+          <dd>Run <code>register</code> again on the same folder. Finished encodes are kept; the rest continue.</dd>
           <dt>Install says tap isn’t trusted</dt>
           <dd>Run <code>brew trust anantdark/macpaper</code>, then install again.</dd>
           <dt>Encode fails / asks for developer tools</dt>
-          <dd>Install Xcode Command Line Tools: <code>xcode-select --install</code>.</dd>
+          <dd>Install Xcode Command Line Tools: <code>xcode-select --install</code>. Use macpaper <strong>1.4.5+</strong> if you hit AVAssetWriter <code>-16364</code> on 23.976&nbsp;fps sources.</dd>
           <dt>“Aerial manifest not found”</dt>
           <dd>In System Settings, download any built-in Aerial once so macOS creates <code>entries.json</code>.</dd>
         </dl>
